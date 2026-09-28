@@ -1,0 +1,20 @@
+# ---- 运行时产物（仿真与可视化生成，不入库）----
+build/
+*.vcd
+*.vvp
+*.out
+*.log
+
+# ---- 仓库私有工具链 ----
+# iverilog/GTKWave 安装在仓库内的 .tools/ 下，避免污染系统 PATH。
+# 这是二进制大文件（约 25MB+），不入版本控制。
+.tools/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+
+# ---- 编辑器 ----
+.vscode/
+.idea/
+*.swp

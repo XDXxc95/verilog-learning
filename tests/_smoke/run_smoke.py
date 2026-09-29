@@ -331,6 +331,89 @@ CASES: list[Case] = [
         expect={"verdict.inconclusive": True, "run.returncode": 0},
         why="退出码 0 且无报错，但**绝不能判通过** —— 证据不足就是证据不足",
     ),
+    # ---- 参数覆盖（--param）。四条一组：生效 / 默认值 / 拒绝瞎猜 / 硬报错 ----
+    Case(
+        name="参数覆盖：--param 真的改到了 elaboration",
+        args=[_rel(SMOKE / "dut_counterN.v"), "--tb", _rel(SMOKE / "tb_counterN.v"),
+              "--param", "WIDTH=3"],
+        status="pass", exit_code=0,
+        # 这一行是"参数真生效了"的直接证据：判定结果本身分不出
+        # "参数生效" 和 "参数被静默忽略"（后者仿真照跑，只是用默认值）
+        tail_has=["EFFECTIVE_WIDTH=3"],
+        expect={"verdict.passed": 3, "verdict.total": 3,
+                # WIDTH=3 时数 8 拍回绕到 0，回绕这个覆盖点也打到了
+                "cover.ok": True, "cover.affects_verdict": False,
+                "cover.n_declared": 3, "cover.n_covered": 3, "cover.n_missed": 0,
+                "cover.missed": [], "cover.complete": True, "cover.ratio": 1.0},
+        why="参数透传链路（sim.py 定根模块 → -P → 测试台 → DUT）走通："
+            "判定期望值随 WIDTH 现算，参数没生效时 count_8_clocks 必红",
+    ),
+    Case(
+        name="参数覆盖：不传参数就是默认值",
+        args=[_rel(SMOKE / "dut_counterN.v"), "--tb", _rel(SMOKE / "tb_counterN.v")],
+        status="pass", exit_code=0,
+        tail_has=["EFFECTIVE_WIDTH=4"],
+        expect={"verdict.passed": 3, "verdict.total": 3,
+                # WIDTH=4 数 8 拍不回绕，"回绕"这个覆盖点天然打不到
+                "cover.n_declared": 3, "cover.n_covered": 2, "cover.n_missed": 1,
+                "cover.missed": ["count_wraps"], "cover.complete": False,
+                "cover.ratio": 0.667},
+        why="与上一条配对：同一个测试台、不同的参数给出不同结果，"
+            "才说明参数是生效的，而不是测试台把期望值写死了",
+    ),
+    Case(
+        name="参数覆盖：定不下根模块时宁可拒绝，不猜",
+        args=[_rel(SMOKE / "dut_counterN.v"), _rel(NEG / "dut_mux2.v"),
+              "--param", "WIDTH=3"],
+        status="usage_error", exit_code=64,
+        expect={"error.kind": "no_root_for_param"},
+        why="iverilog 的 -P 只认根模块，且**放错模块时静默忽略**"
+            "（实测退出码 0、仿真照跑、参数保持默认值）。"
+            "宁可不跑也不能猜一个根模块，否则使用者拿到的是悄悄不对的结果",
+    ),
+    Case(
+        name="参数覆盖：参数名在根上不存在 → 硬报错",
+        args=[_rel(SMOKE / "dut_counterN.v"), "--tb", _rel(SMOKE / "tb_counterN.v"),
+              "--param", "NOSUCH=3"],
+        status="compile_error", exit_code=2,
+        tags=["param_not_found"],
+        # first_error 必须是这条诊断：iverilog 把它打成 ":0:"（没有文件定位），
+        # 以前整条会被丢掉 —— 编译明明失败了，diagnostics 却是空的、
+        # first_error 是 null。这条断言就是钉住那个修复。
+        expect={"compile.ok": False,
+                "compile.first_error.kind": "param_not_found"},
+        why="「模块名对、参数名错」是 iverilog 唯一会硬报错的情形，"
+            "必须解析出来并给出可照做的中文提示",
+    ),
+    # ---- specify 路径延迟。一对：默认忽略 / --specify 生效 ----
+    Case(
+        name="specify：默认忽略（按零延迟跑）",
+        args=[_rel(SMOKE / "dut_dly.v"), "--tb", _rel(SMOKE / "tb_dly.v")],
+        status="fail", exit_code=1,
+        expect={"verdict.failed": 1, "verdict.total": 2},
+        why="不写 --specify 时 iverilog 不认 specify 块。这条是下一条的对照——"
+            "少了它，「开了 --specify 就通过」可能只是因为本来就能过",
+    ),
+    Case(
+        name="specify：--specify 让路径延迟生效",
+        args=[_rel(SMOKE / "dut_dly.v"), "--tb", _rel(SMOKE / "tb_dly.v"),
+              "--specify"],
+        status="pass", exit_code=0,
+        expect={"verdict.passed": 2, "verdict.total": 2},
+        why="同一份设计、同一个测试台，只多一个开关，判定从 fail 翻成 pass",
+    ),
+    # ---- 覆盖点不是判定标记 ----
+    Case(
+        name="覆盖点：只有覆盖标记、没有判定标记 → 仍判「没判定」",
+        args=[_rel(NEG / "dut_mux2.v"), "--tb", _rel(NEG / "tb_cover_only.v")],
+        status="inconclusive", exit_code=1,
+        expect={"verdict.protocol_used": False,
+                "verdict.inconclusive": True,
+                # 覆盖数据照样给，和"没判定"互不干扰
+                "cover.ok": True, "cover.n_declared": 1, "cover.n_covered": 1},
+        why="覆盖点一旦把 protocol_used 置起来，只打覆盖点的测试台就会被误判成"
+            "「按协议汇报过判定」；覆盖是观察项，不许碰判定",
+    ),
 ]
 
 
@@ -429,7 +512,8 @@ def main() -> int:
 # （波形解析要 VCD，绘制检查要 node），任何一个缺失都不该拖垮其余部分。
 TOOL_CHECKS = ["check_wave.py", "check_wave_js.py", "check_wave_draw.py",
                "check_observe.py", "check_schematic.py", "check_lesson.py",
-               "check_manifest.py", "check_vlint.py"]
+               "check_regress.py", "check_synth.py", "check_cov.py",
+               "check_toggle.py", "check_manifest.py", "check_vlint.py"]
 
 
 def _run_tool_checks() -> int:

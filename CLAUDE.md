@@ -229,7 +229,7 @@ solutions/L1-05/artifacts/decoder3_8/   实际运行产物（lesson.py 生成）
 - **`gap` 分两种**：`software` = 缺软件（装了就好）；`code` = **本仓库还没实现**（装什么都没用）。混了会让使用者去装没用的工具。`evaluate()` 里 `gap=="code"` 必须显式排除——这类能力通常 `requires` 为空，不排除就会判成「可用」。
 - **影响分级四级**：`blocks`（整讲做不了）/ `degrades`（动手环节塌掉）/ `shrinks`（缩水但主课能上）/ `talk_only`（**大纲从未承诺能动手**）。`talk_only` 那几项（STA、DFT、功耗）缺工具**不构成课程缺陷**，别急着改大纲。
 - **「文件在」不等于「能用」，探测必须真跑一次**。能力的满足条件是 `found and usable`，不是 `found`。`check` 里三个字段都在为这件事服务：`env`（运行必需的环境变量）、`lib_dirs`（并入 PATH，**不是覆盖**）、`functional.args`（功能自检，退出码非 0 即不可用）。只查 `--version` 等于没查——**verilator 版本号打得出来但 lint 失败**（构建期烘死了 `VERILATOR_ROOT=/yosyshq`），**系统 PATH 上的 g++ 也可能是个太旧的编译器**。这两类误报都实测复现过。
-- **OSS CAD Suite 的分组件 Windows 资产不自包含**。`windows-x64-yosys.tgz` 里一个运行时 DLL 都不带（yosys.exe 要 libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1 一整组），启动即 `STATUS_DLL_NOT_FOUND(0xC0000135)`，**没有任何输出也没有报错**。拿 bleyer iverilog 的同名 msys2 DLL 顶上会变成 `STATUS_ENTRYPOINT_NOT_FOUND(0xC0000139)`，ABI 不兼容，不能混用。
+- **OSS CAD Suite 只装整包，别装分组件**（2026-09-28 踩的分组件，09-29 整包推翻了它）。分组件 Windows 资产不自包含：`windows-x64-yosys.tgz` 里一个运行时 DLL 都不带（yosys.exe 要 libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1 一整组），启动即 `STATUS_DLL_NOT_FOUND(0xC0000135)`，**没有任何输出也没有报错**。而且这不是「补几个 DLL」能修的：整包与 bleyer iverilog 的 `libstdc++-6.dll` 有 C 库 ABI 分裂（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），顶上去只会换成 `STATUS_ENTRYPOINT_NOT_FOUND(0xC0000139)`。**整包（572 MB）已实测全绿**：yosys 0.69+154 / verilator_bin 5.053 / z3 4.15.5 / sby / eqy / slang / gtkwave 逐一起得来，形式验证真跑通了一个 k-induction 作业；代价是 `.tools/oss` 占 2.1 GB，而且**没有卸载/回收路径**。清单里 7 个条目共用这一个归档，靠 `(repo, tag, asset)` 判重只下一次。
 - **verilator 编译链的瓶颈是编译器，不是 make**。本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017），而 verilator 按 GCC 15.2.1 配的；逐个绕过 `-fcf-protection=none` / `python3` / `-lpsapi` / `WinMain` 四个坑也不牢靠。要打通得装现代 mingw-w64（`mingw` 条目，约 250 MB，且候选里只有 winlibs 给 `.zip`——其余只有 `.7z`/`.tar.zst`/自解压 exe，标准库解不了或违反「不运行下载来的可执行文件」）。
 - **L1 必须零缺口**（只依赖 iverilog）。往清单里加 L1 的能力要慎重，会凭空造出缺口。
 - **可复现性**：OSS CAD Suite 的 `bucket-*` 是滚动 tag，同名资产每天覆盖。要固定版本得 `--lock` 记 sha256。
@@ -241,7 +241,7 @@ solutions/L1-05/artifacts/decoder3_8/   实际运行产物（lesson.py 生成）
 - 改完**必须**跑 `python tests/_smoke/run_smoke.py`，全绿才算完。里面有 19 个仿真用例 + 8 个工具检查（波形 JS/DOM 两个需要 node，缺了会自动跳过；5 个用例需要 verilator，缺了报 `⊘` 跳过而不是判失败）。
 - 加新能力时，**同时加一个负例**（能检出错误的用例）。现有负例覆盖：锁存器推断、**组合环（iverilog 沉默）**、零延迟死循环、`wait` 挂死、阻塞赋值导致流水线塌陷、语法错误、顶层名写错、测试台不输出标记、**verilator 缺席时如实报「没跑」**、**程序起来了但不是 verilator**、**`--no-lint` 关得掉且判定逐字段不变**。
 - **`SimConfig` 加字段会打断所有构造点**（`lesson.py` / `viz.py` 各有一处）。已经栽过两次，加字段前先搜一遍。
-- 工具的设计哲学是**「宁可说画不出来，也不画一个看着合理但是错的」**——`schematic.py` 遇到 `generate`、参数化例化会直接标记 `unsupported`，这是有意为之，别为了"支持更多"而猜。
+- 工具的设计哲学是**「宁可说画不出来，也不画一个看着合理但是错的」**。`schematic.py` 对 `generate` 的落地版是：**默认值能算出圈数就展开，算不出来就只丢那一个区域**（图上写明理由，手写部分照画），绝不猜份数——猜出来的 N 会生成一张看着合理、读者无从察觉的错图。`case` generate 明确不支持。详见 `schematic.py` 文件头的取舍清单，改之前先读它。
 
 ## 其他
 

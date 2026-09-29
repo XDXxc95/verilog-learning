@@ -63,7 +63,9 @@ python tools/viz.py tests/_smoke/dut_counter4.v --tb tests/_smoke/tb_counter4.v 
 - [`curriculum/L3-professional.md`](curriculum/L3-professional.md)
 
 > **L3 有个前提要说清楚**：仓库自带的只有 iverilog（仿真器）。据此——
-> **能补的**：装 yosys 就能真综合、看门数、比状态编码；装 verilator 能补真 lint；装 sby/eqy/z3 能做形式验证。这些都在 Windows 原生有方案。
+> **能补的**：装 yosys 就能真综合、看门数；装 verilator 能补真 lint；装 sby/eqy/z3 能做形式验证。这些都在 Windows 原生有方案。
+> **顺带一提**：状态编码的取舍**不用装东西也能动手一半**——面积那半看 `tools/synth.py`，
+> 翻转那半看 `tools/toggle.py`（灰码少翻转的价值，综合器量不出来，只有仿真知道）。
 > **补不了的**：STA、CDC 静态检查、DFT、功耗分析在 Windows 原生**无方案**（要 WSL2，本仓库默认不装），只能讲原理、读报告样例、手算 slack。
 > **另外**：L3-18 的 SVA 无论工具怎么配都要改大纲——iverilog 不支持 `assert property`。
 > 详见 [`curriculum/L3-professional.md`](curriculum/L3-professional.md)，体检用 `python tools/check_tools.py --level L3`。
@@ -113,6 +115,10 @@ solutions/L1-05/decoder3_8.v       参考答案
 | 终端里看 ASCII 波形 | `python tools/viz.py <design.v> --tb <tb.v> --ascii` |
 | 我的实现 vs 参考答案对照 | `python tools/viz.py --compare solutions/L1-05/decoder3_8.v exercises/L1-05/decoder3_8.v --tb tests/L1-05/tb_decoder3_8.v --top decoder3_8` |
 | 生成一讲的产物包（出课程材料用） | `python tools/lesson.py L1-05` |
+| **参数化批量回归** | `python tools/regress.py <design.v> --tb <tb.v> --top tb_x --param WIDTH=4,8` |
+| **综合 / 资源估算 / 门级网表** | `python tools/synth.py <design.v> --top x --compare bin,onehot,gray` / `--netlist` |
+| **功能覆盖率合并**（多份测试台） | `python tools/cov.py tests/L2-40/*.json` |
+| **状态寄存器逐位翻转计数**（编码取舍的另一半） | `python tools/toggle.py build/bin.vcd build/gray.vcd --signal st` |
 | **按级别体检工具能力** | `python tools/check_tools.py --level L2` |
 | 看清单里有什么工具、装没装 | `python tools/setup_tools.py --list` |
 | 装某个工具（进 `.tools/`） | `python tools/setup_tools.py --install yosys verilator --lock` |
@@ -285,4 +291,12 @@ python tools/setup_toolchain.py --selftest   # 装完编译+仿真跑一遍验�
 - ✅ **lint 层** —— 编译通过后再跑一遍结构检查：自研 `_lint.py`（锁存器，零依赖）+
   外部 verilator（位宽/组合环/多驱动/未驱动）。**只加 warning，永不改判定**。
   负例 `tests/_smoke/neg/dut_comb_loop.v` 展示的正是「三条用例全过 + 报出组合环」
+- ✅ **四个零下载入口** —— `regress.py`（参数化批量回归，防「扫了但没扫到区别」）、
+  `synth.py`（三种状态编码对比 + blif 门级网表，用 iverilog 自带后端）、
+  `cov.py`（功能覆盖率**取并集不取平均**，并抓「命中名拼错」）、
+  `toggle.py`（状态寄存器逐位翻转计数，量的是**编码代价的另一半**——
+  综合器不做活动性分析，这一半只有仿真知道）。
+  **都不需要额外装任何东西**，对应的能力项因此是 `gap: "none"`。见 [`tools/README.md`](tools/README.md)
+- ✅ **工具清单已无「缺代码」项** —— 25 项能力里 `gap` 只剩 `none` / `software` 两种；
+  剩下要装的（yosys / verilator / mingw / sby…）**卡口是软件本身，不是仓库欠代码**
 - ⬜ **开始学习** —— 等明确指令，届时**先新建学习分支**，再选级别

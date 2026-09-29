@@ -78,6 +78,7 @@ class DiagKind(StrEnum):
     LATCH_INFERENCE = "latch_inference"
     INFINITE_LOOP = "infinite_loop"
     PORT_MISMATCH = "port_mismatch"
+    PARAM_NOT_FOUND = "param_not_found"
     MULTIPLE_DRIVER = "multiple_driver"
     WIDTH_MISMATCH = "width_mismatch"
     UNUSED = "unused"
@@ -101,6 +102,10 @@ class Hint:
 _RULES: list[tuple[re.Pattern, DiagKind]] = [
     (re.compile(r"top level module not found", re.I), DiagKind.BAD_TOP),
     (re.compile(r"Unknown module type:\s*(\w+)", re.I), DiagKind.UNKNOWN_MODULE),
+    # -P 指定的参数在**根模块**上不存在。iverilog 原文：
+    #     :0: error: parameter `MAX` not found in `tb_dut`.
+    # 注意它没有文件定位（写成 :0:），所以得先去掉这个前缀才解析得到。
+    (re.compile(r"parameter\s+\S+\s+not found in", re.I), DiagKind.PARAM_NOT_FOUND),
     (re.compile(r"Unable to bind (wire|reg|memory)", re.I), DiagKind.UNBOUND),
     (re.compile(r"implicit definition of wire", re.I), DiagKind.UNDECLARED),
     (re.compile(r"Unable to open file|No such file or directory", re.I), DiagKind.FILE_NOT_FOUND),
@@ -197,6 +202,17 @@ HINTS: dict[DiagKind, Hint] = {
         ["把实例的端口列表与模块定义逐个对齐", "建议改用具名连接 .port(sig) 避免顺序错"],
         "medium",
     ),
+    DiagKind.PARAM_NOT_FOUND: Hint(
+        "命令行给的参数名，在顶层模块上找不到对应的 parameter。",
+        "iverilog 的 -P 只认**根模块**上声明的参数。本仓库跑仿真时根模块是测试台，"
+        "所以参数必须声明在测试台上，再由测试台透传给待测模块——直接写待测模块"
+        "的名字是不生效的（实测：模块名写错时 iverilog **一声不响**，退出码 0，"
+        "仿真照跑，只是参数保持默认值。这是最坏的一种失败：不报错、结果不对）。",
+        ["在测试台模块上声明参数：`module tb_xxx #(parameter W = 8);`",
+         "把它接到待测模块的实例上：`dut #(.W(W)) u (...);`",
+         "参数名逐个字符核对（Verilog 区分大小写）"],
+        "high",
+    ),
     DiagKind.WIDTH_MISMATCH: Hint(
         "位宽不一致，可能发生截断或符号扩展。",
         "赋值两边的位宽不同。Verilog 不会报错，只会静默截断高位或扩展——波形看起来「莫名不对」的常见根因。",
@@ -256,6 +272,12 @@ _DIAG_RE = re.compile(
 )
 # 没有文件定位的裸报错，例如： error: Unable to open file foo.v
 _BARE_RE = re.compile(r"^(?P<sev>error|warning|note):[ \t]*(?P<msg>.+)$")
+# iverilog 在**没有文件定位**时会打一个 ":0:" 前缀，例如：
+#     :0: error: parameter `MAX` not found in `tb_dut`.
+# _DIAG_RE 要求文件名非空，所以 ":0:" 这种行它匹配不上，会静默丢掉——
+# 结果是编译明明失败了，diagnostics 却是空的、first_error 是 null。
+# 在解析前把这个前缀去掉，让它落进下面的裸报错分支。
+_NOFILE_PREFIX_RE = re.compile(r"^:\d+:[ \t]*")
 # 源码摘录下方用于指位的那一行
 _CARET_RE = re.compile(r"^(?P<pad>[ \t]*)(?P<carets>[\^~]+)[ \t]*$")
 
@@ -337,7 +359,7 @@ def parse_iverilog_stderr(text: str, base: Path) -> list[Diagnostic]:
     i = 0
 
     while i < len(lines):
-        raw = lines[i]
+        raw = _NOFILE_PREFIX_RE.sub("", lines[i])
         m = _DIAG_RE.match(raw)
 
         if m and not _is_bare_only(raw):
@@ -430,11 +452,18 @@ class Marker:
     SUMMARY = "TEST_SUMMARY"
     DONE = "TEST_DONE"
     TIMEOUT = "TEST_TIMEOUT"
+    # 功能覆盖点。这两个**不算判定标记**，见 parse_markers 里的说明。
+    COVER_DECL = "TEST_COVER_DECL"
+    COVER_HIT = "TEST_COVER_HIT"
 
 
+# 覆盖点标记必须排在判定标记之后单独认——不能写成 TEST_COVER 这种前缀，
+# 否则 TEST_COVER_DECL 会被前缀匹配吃成另一个 token。
 _MARKER_RE = re.compile(
-    r"\b(TEST_BEGIN|TEST_PASS|TEST_FAIL|TEST_INFO|TEST_SUMMARY|TEST_DONE|TEST_TIMEOUT)\b(.*)$"
+    r"\b(TEST_BEGIN|TEST_PASS|TEST_FAIL|TEST_INFO|TEST_SUMMARY|TEST_DONE|TEST_TIMEOUT"
+    r"|TEST_COVER_DECL|TEST_COVER_HIT)\b(.*)$"
 )
+_COVER_TOKENS = frozenset({Marker.COVER_DECL, Marker.COVER_HIT})
 _KV_RE = re.compile(r"(\w+)=(\S+)")
 
 
@@ -466,12 +495,23 @@ class Markers:
     summary: dict | None = None
     infos: list[dict] = field(default_factory=list)
     raw_count: int = 0
+    # 覆盖点用**出现顺序去重**，不用 set：顺序是测试台声明的顺序，
+    # 报告里按声明顺序列出来读着顺，也方便和源码对照。
+    cover_decl: list[str] = field(default_factory=list)
+    cover_hit: list[str] = field(default_factory=list)
 
 
 def parse_markers(text: str) -> Markers:
     """解析测试台打印的判定标记。
 
     协议见 tb/tb_common.vh。设计上对格式宽容：缺字段也能用，多打的噪声会忽略。
+
+    ★ 覆盖点标记（TEST_COVER_*）**绝不置 protocol_used**。
+      这个字段的含义是"测试台按协议汇报了判定结果"，_decide() 拿它区分
+      「跑完了没判定」和「压根没按协议来」。覆盖点是可以单独出现的
+      （一个只声明覆盖点、不写 TEST_PASS 的测试台仍然是"没判定"），
+      让它们置位会把「没判定」误升成「判定了」，进而可能判成通过。
+      这和 lint 那条铁律是同一个道理：观察项不许改判定。
     """
     mk = Markers()
     for line in text.splitlines():
@@ -481,6 +521,15 @@ def parse_markers(text: str) -> Markers:
         token, rest = m.group(1), m.group(2)
         kv = dict(_KV_RE.findall(rest))
         mk.raw_count += 1
+
+        if token in _COVER_TOKENS:
+            point = kv.get("name")
+            if point:
+                dst = mk.cover_decl if token == Marker.COVER_DECL else mk.cover_hit
+                if point not in dst:
+                    dst.append(point)
+            continue
+
         mk.protocol_used = True
 
         if token == Marker.BEGIN:
@@ -574,6 +623,62 @@ class SimConfig:
     no_lint: bool
     iverilog_path: str | None
     verilator_path: Path | None
+    # NAME=VALUE 形式的参数覆盖，**目标一定是根模块**（iverilog 的 -P 只认根）。
+    # 见 _resolve_root()：根不是测试台时，参数压根不会生效，而且 iverilog 不吭声。
+    params: list[str] = field(default_factory=list)
+    # 打开 specify 块里的路径延迟（-gspecify）。默认关：不看时序的练习
+    # 开着它只会让波形多出一些看着莫名其妙的延迟。
+    specify: bool = False
+
+
+_PARAM_RE = re.compile(r"^([A-Za-z_]\w*)=(.*)$", re.DOTALL)
+
+
+def _parse_params(raw_params: list[str]) -> tuple[list[str], str | None]:
+    """校验 --param 的写法，返回 (归一化后的列表, 出错时的说明)。"""
+    out: list[str] = []
+    for item in raw_params:
+        text = item.strip()
+        m = _PARAM_RE.match(text)
+        if not m:
+            return [], (
+                f"--param 的写法应该是 NAME=VALUE，收到的是 {text!r}。"
+                "（例如 --param W=8）"
+            )
+        name, value = m.group(1), m.group(2)
+        if not value:
+            return [], f"--param {text!r} 只给了名字没给值。"
+        out.append(f"{name}={value}")
+    return out, None
+
+
+def _resolve_root(cfg: "SimConfig", modules: list[str]) -> tuple[str | None, str | None]:
+    """给 -P 定一个确定的根模块。返回 (根模块名, 拒绝的理由)。
+
+    为什么非要"确定"：iverilog 的 -P 只认**根模块**上的 parameter，而根模块
+    不是它时**它一声不响**——实测把 `-Pdut.MAX=6` 加在根为 `tb_dut` 的编译上，
+    退出码 0、仿真照常跑完，只是参数保持默认值。这比报错坏得多：
+    学习者会以为参数生效了，拿着错的结果去排查别的地方。
+    （模块名压根不存在时同样沉默；只有"模块对、参数名错"才是硬报错。）
+    所以这里**只认能唯一确定的情形，否则明确拒绝**，不去猜。
+    """
+    if cfg.top:
+        return cfg.top, None
+    if cfg.tb and cfg.tb.is_file():
+        tb_mods = scan_modules([cfg.tb])
+        if len(tb_mods) == 1:
+            return tb_mods[0], None
+        if len(tb_mods) > 1:
+            return None, (
+                f"测试台 {cfg.tb.name} 里定义了不止一个模块"
+                f"（{'、'.join(tb_mods)}），确定不了哪个是顶层。请用 --top 说明。"
+            )
+    if len(modules) == 1:
+        return modules[0], None
+    return None, (
+        "确定不了顶层模块，参数不知道该放到哪个模块上。请用 --top 指明顶层模块名。"
+        "（参数必须声明在顶层上：iverilog 的 -P 只对根模块生效，放错地方它会静默忽略。）"
+    )
 
 
 def _result(status: str, **extra) -> dict:
@@ -594,9 +699,69 @@ def _result(status: str, **extra) -> dict:
             "n_warnings": 0, "n_errors": 0,
         },
         "observe": {"ok": False, "reason": "本次没有运行仿真（编译或环境未通过）"},
+        "cover": _cover_block(reason="本次没有运行仿真（编译或环境未通过）"),
     }
     base.update(extra)
     return base
+
+
+def _cover_block(markers: Markers | None = None, reason: str | None = None) -> dict:
+    """功能覆盖点汇总。
+
+    ★ 覆盖**不参与判定**：`affects_verdict` 恒为 False，`_decide()` 一眼都不看它。
+      理由和 lint 一样，但更直白：覆盖点回答的是"测试台验收的场景跑全了没有"，
+      不是"待测模块对不对"。用例全过而覆盖有洞，说明**测得浅**，
+      该提醒的是"再加两条激励"，不是"你写错了"——把 status 翻成 fail
+      会让学习者看到"明明全过却判失败"，然后去改本来是好的代码。
+      所以它是观察项，和 observe / lint 同等地位。
+
+    ★ `ok` 区分的是「**没跑覆盖**」和「**跑了、全覆盖**」：
+      没有 TEST_COVER_DECL 时 ok=False 且 n_declared=0、ratio=None，
+      这时 `complete` **必须是 False**。若让它取 True，
+      下游会把"压根没统计"读成"覆盖齐全"，正好是相反的两件事。
+    """
+    if markers is None:
+        return {
+            "ok": False,
+            "affects_verdict": False,
+            "declared": [], "hit": [], "missed": [], "undeclared_hits": [],
+            "n_declared": 0, "n_covered": 0, "n_missed": 0,
+            "ratio": None, "complete": False, "reason": reason,
+        }
+
+    declared, hit = markers.cover_decl, markers.cover_hit
+    hit_set = set(hit)
+    missed = [p for p in declared if p not in hit_set]
+    undeclared_hits = [p for p in hit if p not in set(declared)]
+    n_declared = len(declared)
+    n_covered = n_declared - len(missed)
+
+    if n_declared:
+        ok, reason = True, None
+    elif hit:
+        ok = False
+        reason = (
+            "测试台打印了 TEST_COVER_HIT 却没有 TEST_COVER_DECL，没有分母，"
+            "覆盖率算不出来（命中的名字原样留在 hit 里，没有丢）。"
+        )
+    else:
+        ok = False
+        reason = "测试台没有使用覆盖点标记（TEST_COVER_DECL / TEST_COVER_HIT），本次没有覆盖数据。"
+
+    return {
+        "ok": ok,
+        "affects_verdict": False,
+        "declared": declared,
+        "hit": hit,
+        "missed": missed,
+        "undeclared_hits": undeclared_hits,
+        "n_declared": n_declared,
+        "n_covered": n_covered,
+        "n_missed": len(missed),
+        "ratio": round(n_covered / n_declared, 3) if n_declared else None,
+        "complete": bool(n_declared) and not missed,
+        "reason": reason,
+    }
 
 
 def _observe_block(
@@ -688,6 +853,31 @@ def _run_sim(cfg: SimConfig) -> tuple[dict, int]:
             EXIT_COMPILE_ERROR,
         )
 
+    # ---- 参数覆盖：先把根模块定下来 ----
+    # 必须放在 bad_top 预检之后：顶层名字写错时，那条提示比这里的更有用。
+    params, perr = _parse_params(cfg.params)
+    if perr:
+        return (
+            _result(
+                "usage_error",
+                error={"kind": "bad_param", "message": perr},
+                next_actions_zh=["把 --param 写成 NAME=VALUE，例如 --param W=8"],
+            ),
+            EXIT_USAGE,
+        )
+    effective_top = cfg.top
+    if params and not effective_top:
+        effective_top, rerr = _resolve_root(cfg, modules)
+        if rerr:
+            return (
+                _result(
+                    "usage_error",
+                    error={"kind": "no_root_for_param", "message": rerr},
+                    next_actions_zh=["用 --top 指明顶层模块名后重试"],
+                ),
+                EXIT_USAGE,
+            )
+
     cfg.workdir.mkdir(parents=True, exist_ok=True)
     vvp_path = cfg.workdir / f"{cfg.name}.vvp"
 
@@ -699,8 +889,17 @@ def _run_sim(cfg: SimConfig) -> tuple[dict, int]:
         cmd += ["-I", inc]
     for d in cfg.defines:
         cmd += ["-D", d]
-    if cfg.top:
-        cmd += ["-s", cfg.top]
+    if cfg.specify:
+        # 让 specify 块里的路径延迟真正生效。默认是**被忽略**的，
+        # 也就是说：不写这个开关，源码里的 specify 是摆设，仿真跑的是零延迟。
+        cmd += ["-gspecify"]
+    # 有 --param 时**一定**把 -s 写死：根模块一旦不是我们以为的那个，
+    # -P 就会被静默忽略（见 _resolve_root 的说明）。写上 -s 之后，
+    # 猜错会变成一条硬报错，而不是一个悄悄不对的结果。
+    if effective_top:
+        cmd += ["-s", effective_top]
+    for p in params:
+        cmd += [f"-P{effective_top}.{p}"]
     if cfg.syntax_only:
         cmd += ["-t", "null", "-o", str(cfg.workdir / f"{cfg.name}.null")]
     else:
@@ -827,6 +1026,7 @@ def _run_sim(cfg: SimConfig) -> tuple[dict, int]:
             "vcd_all": [str(cfg.workdir / v) for v in vcd_new],
         },
         observe=_observe_block(cfg, root, vcd_new, tests),
+        cover=_cover_block(markers),
         error_tags=_error_tags(diags, markers, rres),
         next_actions_zh=_run_next_actions(status, markers, rres, tests, diags),
     )
@@ -967,10 +1167,25 @@ def _vlint_diagnostics(
         file_abs = _norm_path(w.file, root) if w.file else None
         if (file_abs, str(kind)) in already:
             continue
-        hint = HINTS.get(kind, HINTS[DiagKind.OTHER])
-        why = hint.why
-        if w.note:
-            why = f"{why}（verilator 补充：{w.note}）"
+        # ★ 没映射到类别时**不能**借用 OTHER 那条提示：它写的是
+        #   "iverilog 报了一个未归类的错误"，而这条是 verilator 报的**警告**——
+        #   来源和严重性两处都说错了（上面 _VLINT_KIND 的注释刚说过
+        #   "给一条对不上症状的中文解释，比不给更坏"，这里正是那种情况）。
+        #   宁可老实说"没有对应解释，请读原文"，并把警告编号留在消息里让人去查。
+        hint = None if kind == DiagKind.OTHER else HINTS.get(kind)
+        if hint is None:
+            why = (
+                "这条来自 verilator 的 lint，本仓库还没有对应类别的中文解释。"
+                "请直接读原文；方括号里是 verilator 的警告编号，可以拿它去查。"
+            )
+            if w.note:
+                why += f"（verilator 补充：{w.note}）"
+            fixes: list[str] = []
+        else:
+            why = hint.why
+            if w.note:
+                why = f"{why}（verilator 补充：{w.note}）"
+            fixes = list(hint.fixes)
         out.append(Diagnostic(
             severity="warning",
             kind=str(kind),
@@ -984,9 +1199,9 @@ def _vlint_diagnostics(
                 None if (path is None or _is_hidden(path, root))
                 else _read_line(path, w.line)
             ),
-            hint_zh=hint.what,
+            hint_zh=hint.what if hint else None,
             why_zh=why,
-            fix_suggestions_zh=list(hint.fixes),
+            fix_suggestions_zh=fixes,
             confidence=conf,
         ))
 
@@ -1206,6 +1421,11 @@ def _compile_next_actions(errors: list[Diagnostic]) -> list[str]:
         out.append("有未声明的信号被当作 1 位隐式 wire，请补上带位宽的显式声明")
     if DiagKind.UNKNOWN_MODULE in kinds:
         out.append("实例化的模块找不到，确认模块名拼写并确保其源文件已加入编译")
+    if DiagKind.PARAM_NOT_FOUND in kinds:
+        out.append(
+            "参数名在顶层模块上不存在：请把 parameter 声明在测试台上"
+            "（module tb_xxx #(parameter W = 8);），再透传给待测模块"
+        )
     if not out:
         out.append("编译未通过，请按 first_error 中的提示逐条修复")
     return out
@@ -1226,8 +1446,25 @@ def _run_next_actions(
         for d in latch[:3]
     ] if latch else []
 
+    # 覆盖点没打到的，**只在判定通过时说**。
+    # 判定失败时学习者的注意力该在"哪里错了"，这时再叠一句"还有个场景没测"
+    # 只会分散注意力；而"全过"恰恰是最需要这句话的时刻——用例是他自己写的，
+    # 全过的时候他最容易以为"验完了"。
+    missed = [p for p in markers.cover_decl if p not in set(markers.cover_hit)]
+    cover_notes = []
+    if missed and status == "pass":
+        shown = "、".join(missed[:4])
+        more = f" 等 {len(missed)} 个" if len(missed) > 4 else ""
+        cover_notes = [
+            f"有 {len(missed)} 个覆盖点没打到：{shown}{more}。"
+            "这不影响本次判定（用例确实都过了），但说明测得不够深——"
+            "建议补激励把场景覆盖上，或确认这个点是不是已经不需要了。"
+        ]
+
     if status == "pass":
-        return latch_notes + ["全部用例通过。可以查看波形，把代码和时序对上。"]
+        return latch_notes + cover_notes + [
+            "全部用例通过。可以查看波形，把代码和时序对上。"
+        ]
     if status == "timeout":
         return latch_notes + ["检查 always 块是否缺少延时或事件控制，导致仿真时间无法推进"]
     if status == "inconclusive":
@@ -1270,6 +1507,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--gflag", action="append", default=[], help="传给 iverilog 的 -g 参数")
     ap.add_argument("--include", action="append", default=[], help="额外的 include 目录")
     ap.add_argument("--define", action="append", default=[], help="宏定义 NAME[=VALUE]")
+    ap.add_argument("--param", action="append", default=[], metavar="NAME=VALUE",
+                    help="覆盖顶层模块的参数（可重复）。名字必须声明在顶层模块上——"
+                         "iverilog 的 -P 只认根模块，本仓库的根是测试台")
+    ap.add_argument("--specify", action="store_true",
+                    help="让 specify 块里的路径延迟生效（-gspecify）。默认忽略")
     ap.add_argument("--syntax-only", action="store_true", help="只做编译检查，不仿真")
     ap.add_argument("--no-vcd", action="store_true", help="忽略波形产物")
     ap.add_argument("--no-observe", action="store_true",
@@ -1310,6 +1552,8 @@ def main(argv: list[str] | None = None) -> int:
         no_lint=args.no_lint,
         iverilog_path=args.iverilog_path,
         verilator_path=args.verilator_path,
+        params=args.param,
+        specify=args.specify,
     )
 
     result, code = _run_sim(cfg)
@@ -1410,6 +1654,30 @@ def _print_summary(result: dict, code: int) -> None:
             bits.append(piece)
         w("-" * 60 + "\n")
         w("  观察：" + "；".join(bits) + "\n")
+
+    # 覆盖点。**只在真有数据（或有值得说的异常）时打印**——
+    # 这一点和 lint 不同：lint 是每次编译都会跑的一项检查，所以"没跑"
+    # 必须显式说出来；而覆盖点是个可选功能，绝大多数练习压根不用它，
+    # 每次都报一句"本次没有覆盖数据"只是噪音，会把人训练成不看这一行。
+    # 机器要区分"没统计/统计了"仍然可以——cover.ok 在 JSON 里一直都在。
+    # 但 `undeclared_hits` 这种**异常**不能省：那是测试台自己的 bug。
+    cov = result.get("cover") or {}
+    if cov.get("ok"):
+        piece = f"覆盖点 {cov.get('n_covered', 0)}/{cov.get('n_declared', 0)}"
+        if cov.get("ratio") is not None:
+            piece += f"（{cov['ratio'] * 100:.0f}%）"
+        if cov.get("missed"):
+            piece += "，没打到：" + "、".join(cov["missed"][:4])
+            if len(cov["missed"]) > 4:
+                piece += f" 等 {len(cov['missed'])} 个"
+        w("-" * 60 + "\n")
+        w(f"  {piece}\n")
+        w("  （覆盖点不影响判定，只说明测得够不够深）\n")
+    elif cov.get("undeclared_hits"):
+        w("-" * 60 + "\n")
+        w("  覆盖点：有命中却没有声明——"
+          + "、".join(cov["undeclared_hits"][:4])
+          + "（测试台少了 TEST_COVER_DECL，覆盖率算不出来）\n")
 
     if v.get("note_zh"):
         w(f"  说明：{v['note_zh']}\n")

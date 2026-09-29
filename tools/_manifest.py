@@ -75,6 +75,17 @@ class Software:
     raw: dict
     check_exe: str | None = None
     version_arg: str | None = None
+    # 只认仓库私有的那一份，**不回退到系统 PATH**。
+    #
+    # 默认 False 是有道理的：使用者在系统上早就装过某个工具时，复用它比
+    # 逼他再装一份好。但有一条例外——**结果取决于版本的工具不能复用**。
+    # g++ 就是典型：verilator 是按 GCC 15.2.1 配的，撞上系统 PATH 上那个
+    # 2017 年的 mingw 7.3 会连报四个错，而报告里只会写"已安装但不可用"，
+    # 使用者照着去查 PATH 也找不到原因。
+    #
+    # 这类工具在清单里写 `"repo_private": true`，探测就只认 `.tools/`：
+    # 没装就是**没装**（可以装），而不是"装了但用不了"（无从下手）。
+    repo_private: bool = False
 
     @property
     def install_dest(self) -> Path | None:
@@ -181,6 +192,7 @@ def load(path: Path | None = None) -> Manifest:
                 raw=raw,
                 check_exe=chk.get("exe"),
                 version_arg=chk.get("version_arg"),
+                repo_private=bool(raw.get("repo_private", False)),
             )
         )
     for raw in data.get("capabilities", []):
@@ -219,6 +231,14 @@ def validate(m: Manifest) -> list[str]:
         seen_sw.add(s.id)
         if s.windows not in WINDOWS_LABEL:
             problems.append(f"software {s.id} 的 windows 值未知：{s.windows!r}")
+        # repo_private 的意义就是"只认装进 .tools/ 的那一份"，
+        # 没写 install.dest 就没有 .tools/ 可认 —— 于是它会在任何机器上
+        # 都判成未安装，且装也装不进来。这种配置错误不会崩，只会永远缺着。
+        if s.repo_private and not s.install_dest:
+            problems.append(
+                f"software {s.id} 标了 repo_private 但没有 install.dest，"
+                f"没有可认的私有安装位置"
+            )
 
     for c in m.capabilities:
         if c.id in seen_cap:
@@ -234,11 +254,32 @@ def validate(m: Manifest) -> list[str]:
         if not c.levels:
             problems.append(f"capability {c.id} 没写 levels")
 
-    # 反向一致性：software.provides 与 capability.requires 应对得上
+    # provides ↔ requires 双向一致性。**只查一个方向不够**——
+    # 2026-09-29 实测抓到：slang.provides 说它提供 lint.full，而
+    # lint.full.requires 是 ['verilator']。两个方向各自看着都成立，
+    # 合起来是一句假话：「装着 slang 却显示 lint.full 可用」还是轻的，
+    # 真正的问题是使用者会以为这条能力有两个来源。
+    #
+    # provides ⊆ requires 是**声明性**的：它说的是「装了谁这条能力就满足」，
+    # 所以两边必须逐条对得上，不能有一边多出来。
+    cap_requires = {c.id: set(c.requires) for c in m.capabilities}
     for s in m.software:
         for cid in s.raw.get("provides", []):
             if cid not in seen_cap:
                 problems.append(f"software {s.id} 的 provides 引用了不存在的 capability：{cid}")
+            elif s.id not in cap_requires.get(cid, set()):
+                problems.append(
+                    f"software {s.id} 的 provides 说它提供 {cid}，"
+                    f"但 {cid}.requires = {sorted(cap_requires.get(cid, set()))}，"
+                    f"两边对不上"
+                )
+    for c in m.capabilities:
+        for sid in c.requires:
+            s = m.software_by_id(sid)
+            if s is not None and c.id not in set(s.raw.get("provides", [])):
+                problems.append(
+                    f"capability {c.id} 依赖 {sid}，但 {sid}.provides 里没写这条"
+                )
 
     return problems
 
@@ -332,13 +373,24 @@ def locate(sw: Software, extra: Path | None = None) -> Path | None:
         if cand.is_file():
             return cand
 
+    if sw.repo_private:
+        # 见 Software.repo_private：这类工具的结果取决于版本，
+        # 复用系统上的那一份得到的是"能跑但结论不对"，比找不到更坏。
+        return None
+
     # 最后试系统 PATH：使用者可能早就在系统上装过，允许复用，但不改动它
     which = shutil.which(sw.check_exe)
     return Path(which) if which else None
 
 
 def probe(sw: Software, extra_path: list[Path] | None = None) -> ProbeResult:
-    """探测单个软件。找不到不是异常，是正常结果。"""
+    """探测单个软件。找不到不是异常，是正常结果。
+
+    `extra_path` 是**模拟「这个目录也在系统 PATH 上」**，给测试用的
+    （正式调用方一个都没用，见 locate() 的 `extra` 才是显式指定路径）。
+    所以标了 repo_private 的软件**连它也不认**——否则"私有化"就成了
+    "只要调用方换个说法就能复用系统那一份"，负例也就验不出东西了。
+    """
     env = {**os.environ, **tool_env(sw)}
 
     if not sw.check_exe:
@@ -357,11 +409,23 @@ def probe(sw: Software, extra_path: list[Path] | None = None) -> ProbeResult:
 
     exe_name = _exe(sw.check_exe)
     searched: list[str] = []
-    for d in (extra_path or []) + _candidate_locations(sw):
+    extra_dirs = [] if sw.repo_private else list(extra_path or [])
+    for d in extra_dirs + _candidate_locations(sw):
         searched.append(str(d))
         cand = d / exe_name
         if cand.is_file():
             return _finish_probe(sw, cand, env, searched, from_path=False)
+
+    if sw.repo_private:
+        # **不去系统 PATH 找一个替代品**。硬找一个回来会让报告显示
+        # 「已安装但不可用」，而真正的问题是"仓库私有那一份没装"——
+        # 前者让人去翻 PATH，后者直接给出一条能照做的安装命令。
+        return ProbeResult(
+            software_id=sw.id,
+            found=False,
+            searched=searched,
+            detail="只认仓库私有安装（清单里标了 repo_private），系统 PATH 上的同名工具不算",
+        )
 
     # 最后试系统 PATH（用户可能早就在系统上装过，允许复用，但不改动它）
     searched.append("PATH")

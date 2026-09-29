@@ -60,12 +60,209 @@ def main() -> int:
               f"`if (cnt <= 4'd5)` 里的 cnt 被当成赋值左侧抠掉了，rhs={blk.rhs}")
         check(blk.lhs == ["flag"], f"cmp_test 的写集合应为 [flag]，实际 {blk.lhs}")
 
-    # ---------------- 3. generate ----------------
+    # ---------------- 3. generate：边界能算出来，就该展开 ----------------
     m = design.modules.get("gen_test")
+    check(m is not None, "gen_test 没解析出来")
     if m:
-        check(any("generate" in u for u in m.unsupported),
-              "generate 必须进 unsupported（展开要参数取值，推不出来）")
-        check(not m.blocks, "generate 里的 assign 不应该被当成顶层 assign 画出来")
+        check(not m.unsupported,
+              f"循环上界是裸字面量的 generate 不该拒绝：{m.unsupported}")
+        check(len(m.blocks) == 1,
+              f"4 圈同一条 assign 在信号级完全一样，应合并成 1 条，实际 {len(m.blocks)} 条")
+        if len(m.blocks) == 1:
+            b = m.blocks[0]
+            check(b.lhs == ["y"] and b.rhs == ["a"],
+                  f"展开+合并后应是 y <- a，实际 {b.lhs} <- {b.rhs}")
+            check(b.repeat == 4, f"应记下这条代表 4 份，实际 {b.repeat}")
+            check(b.origin == "generate g",
+                  f"应标出它来自 generate g（不然读者会去源码里找一行不存在的 assign），"
+                  f"实际 {b.origin!r}")
+            check(b.line >= 40,
+                  f"展开出来的语句行号要指向源码里 generate 内部那一行，实际 {b.line}")
+
+    # ---------------- 3b. 参数化边界 + 参数化位宽 ----------------
+    m = design.modules.get("gen_param_test")
+    if m:
+        check(m.param_env == {"N": 4, "DW": 8},
+              f"参数默认值应算成 N=4、DW=8，实际 {m.param_env}")
+        check(not m.param_failed,
+              f"这两个参数的默认值都算得出来，不该进 param_failed：{m.param_failed}")
+        wl = {p.name: p.width_label for p in m.ports}
+        check(wl.get("a") == "[8]" and wl.get("y") == "[8]",
+              f"`[DW-1:0]` 应算成 8 位，实际 {wl}")
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 4,
+              f"`i < N` 且 N=4，应展开 4 份合并成 1 条，实际 "
+              f"{[(len(b.lhs), b.repeat) for b in m.blocks]}")
+
+    # ---------------- 3c. 嵌套 generate：变量要一层层套 ----------------
+    m = design.modules.get("gen_nest_test")
+    if m:
+        check(m.param_env == {"R": 2, "C": 3},
+              f"嵌套用例的参数应算成 R=2、C=3，实际 {m.param_env}")
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 6,
+              f"2 圈 × 3 圈 = 6 份，应合并成 1 条 ×6，实际 {len(m.blocks)} 条 "
+              f"{[b.repeat for b in m.blocks]}")
+        if m.blocks:
+            check("C" not in m.blocks[0].rhs and "R" not in m.blocks[0].rhs,
+                  f"位下标里出现的**参数**不是信号，不该进读集合：{m.blocks[0].rhs}")
+        check(not m.unknown_names,
+              f"参数 C 是声明过的，不该报成「未在本模块声明的名字」：{m.unknown_names}")
+        # 嵌套循环会让内层说明攒好几条一模一样的，必须去重
+        check(sum(1 for g in m.gen_notes if "generate col" in g) == 1,
+              f"内层 generate 的说明只该出现一次，实际 {m.gen_notes}")
+
+    # ---------------- 3d. if generate：只画成立的那一支 ----------------
+    m = design.modules.get("gen_if_test")
+    if m:
+        check(len(m.blocks) == 1,
+              f"if/else generate 只该画出成立的那一支，实际 {len(m.blocks)} 条")
+        if m.blocks:
+            check(m.blocks[0].lhs == ["y"] and "a" in m.blocks[0].rhs,
+                  f"WIDE=1 时应画 `y = ~a`，实际 {m.blocks[0].lhs} <- {m.blocks[0].rhs}")
+        check(any("没画" in g for g in m.gen_notes),
+              f"被丢掉的那一支必须写进说明，否则读者以为源码里没有它：{m.gen_notes}")
+        check(not m.instances,
+              f"else 那一支不能被当成顶层语句解析出假节点：{m.instances}")
+        # 边界切错时 else 那一段会掉到普通路径上。它既不该变成假节点，
+        # 也不该**无声无息地消失** —— 消失得有人吭声。
+        check(not any("落单" in u for u in m.unsupported),
+              f"if/else 的分支边界没切对，else 那一支掉了出来：{m.unsupported}")
+
+    # ---------------- 3e. 边界算不出来：必须拒绝，绝不猜份数 ----------------
+    for name, needle in (("gen_macro_test", "N"), ("gen_undef_test", "WIDTH")):
+        m = design.modules.get(name)
+        check(m is not None, f"{name} 没解析出来")
+        if not m:
+            continue
+        check(any("算不出来" in u for u in m.unsupported),
+              f"{name} 的循环边界算不出来，必须拒绝并说明白：{m.unsupported}")
+        check(not m.instances,
+              f"{name}: 那条 `for` 绝不能被当成例化解析出假节点：{m.instances}")
+        check(any(needle in u for u in m.unsupported),
+              f"{name} 的拒绝理由要点出是哪个名字算不出来：{m.unsupported}")
+        # generate 里那几条 assign 一条都不许画出来（它们没有确定的份数）
+        check(all(b.origin == "" for b in m.blocks),
+              f"{name}: 拒绝的 generate 里的 assign 不许漏进普通路径："
+              f"{[(b.origin, b.lhs) for b in m.blocks]}")
+
+    m = design.modules.get("gen_undef_test")
+    if m:
+        check(not m.blocks, f"gen_undef_test 里没有被拒绝之外的东西，不该有块：{m.blocks}")
+
+    m = design.modules.get("gen_macro_test")
+    if m:
+        # 手写的那条 assign 必须照画 —— 一块 generate 算不出来，
+        # 不该把整个模块的内部结构一起停掉
+        check(len(m.blocks) == 1 and m.blocks[0].origin == "",
+              f"算不出来的只是那块 generate，手写的 assign 应当照画："
+              f"{[(b.origin, b.lhs) for b in m.blocks]}")
+        check(m.param_failed == ["N"],
+              f"默认值是个编译宏，N 应进 param_failed（依赖它的图件都停用），"
+              f"实际 {m.param_failed}")
+        wl = {p.name: p.width_label for p in m.ports}
+        check(wl.get("sel") == "[N-1:0]",
+              f"位宽算不出来时要照抄源码原文，**不是**留空"
+              f"（留空会被读成「这是个 1 位信号」）：{wl}")
+
+    # ---------------- 3f. case generate：明确拒绝 ----------------
+    m = design.modules.get("gen_case_test")
+    if m:
+        check(any("case" in u for u in m.unsupported),
+              f"case generate 应明确拒绝并说明原因：{m.unsupported}")
+        check(not m.blocks and not m.instances,
+              f"case 里的 assign 不能被画出来：blocks={m.blocks} insts={m.instances}")
+
+    # ---------------- 3g. generate 里例化：合并成一条并记份数 ----------------
+    m = design.modules.get("gen_inst_test")
+    if m:
+        check(len(m.instances) == 1,
+              f"4 份同样的例化应合并成 1 条（重名的实例名是正常的，"
+              f"唯一名字由层次名给出），实际 {len(m.instances)} 条")
+        if m.instances:
+            i0 = m.instances[0]
+            check(i0.module == "leaf" and i0.repeat == 4,
+                  f"应是 leaf ×4，实际 {i0.module} ×{i0.repeat}")
+        check("q" in m.assigned,
+              f"合并之后 .q(q) 仍然要算作本模块被驱动的信号：{m.assigned}")
+
+    # ---------------- 3h. 对抗性用例（各自抓出过一个真 bug）----------------
+    # 隐式 generate：不带 generate/endgenerate 关键字，光写个 for
+    m = design.modules.get("sg_implicit_for")
+    if m:
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 4,
+              f"模块体里裸写的 for 也是 generate，应展开 4 份：{[(b.lhs, b.repeat) for b in m.blocks]}")
+        check(not m.instances,
+              f"那条 for 不能被当成例化解析出假节点：{[(i.module, i.name) for i in m.instances]}")
+
+    m = design.modules.get("sg_no_begin")
+    if m:
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 4,
+              f"循环体没有 begin-end 也要能展开：{[(b.lhs, b.repeat) for b in m.blocks]}")
+
+    m = design.modules.get("sg_gen_always")
+    if m:
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 2,
+              f"generate 里套 always 应展开成 1 条 ×2：{[(b.lhs, b.repeat) for b in m.blocks]}")
+        if m.blocks:
+            check(m.blocks[0].sequential and m.blocks[0].clock == "clk",
+                  f"展开出来仍应是时序块：{m.blocks[0].label}")
+
+    m = design.modules.get("sg_clog2")
+    if m:
+        wl = {p.name: p.width_label for p in m.ports}
+        check(wl.get("addr") == "[4]",
+              f"`[$clog2(DEPTH)-1:0]`（DEPTH=16）应算成 4 位，实际 {wl}")
+        check(not m.unknown_names,
+              f"$clog2 是系统函数不是信号，不该报未声明：{m.unknown_names}")
+        if m.blocks:
+            check("clog2" not in m.blocks[0].rhs,
+                  f"$clog2 不该进读集合：{m.blocks[0].rhs}")
+
+    # ★ 最要紧的一条反面用例：always 里的 for/if/case 不是 generate
+    m = design.modules.get("sg_not_generate")
+    if m:
+        check(not m.instances,
+              f"always 里的 for/if/case 绝不能被当成 generate 展开："
+              f"{[(i.module, i.name) for i in m.instances]}")
+        check(not any("generate" in u for u in m.unsupported),
+              f"always 体内没有 generate，不该报 generate 相关的问题：{m.unsupported}")
+        check(len(m.blocks) == 1 and m.blocks[0].sequential,
+              f"应是一个时序块：{[(b.lhs, b.origin) for b in m.blocks]}")
+
+    m = design.modules.get("sg_comment_trap")
+    if m:
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 4,
+              f"注释里的 generate/for/endgenerate 必须被无视："
+              f"{[(b.lhs, b.repeat) for b in m.blocks]}")
+
+    m = design.modules.get("sg_nested_if")
+    if m:
+        check(len(m.blocks) == 1 and m.blocks[0].repeat == 3,
+              f"3 圈 × 取一支 = 1 条 ×3：{[(b.lhs, b.repeat) for b in m.blocks]}")
+        if m.blocks:
+            # MODE=2，条件不成立 → 画的是 else 那一支（buf）。
+            # 标成 `generate inv` 就是指着源码里没画出来的那块说"就是它"。
+            check(m.blocks[0].origin == "generate buf",
+                  f"MODE=2 时画的是 else 分支，出处应标 buf，实际 {m.blocks[0].origin!r}")
+        check(any("buf" in g and "inv" in g for g in m.gen_notes),
+              f"说明要同时点出画了哪一支、丢了哪一支（都要带名字）：{m.gen_notes}")
+
+    m = design.modules.get("sg_zero_iter")
+    if m:
+        check(not m.blocks and not m.unsupported,
+              f"循环跑 0 圈是**合法**的，不是错误也不该画东西："
+              f"blocks={m.blocks} unsup={m.unsupported}")
+        check(any("0 份" in g for g in m.gen_notes),
+              f"跑 0 圈要说一声，不然读者以为这块被漏解析了：{m.gen_notes}")
+
+    m = design.modules.get("sg_func_if")
+    if m:
+        check(not m.instances,
+              f"function 体内的 begin/if 碎片不能被解析成节点："
+              f"{[(i.module, i.name) for i in m.instances]}")
+        check(any("function" in u for u in m.unsupported),
+              f"function 应说明按黑盒处理：{m.unsupported}")
+        check(len(m.blocks) == 1 and m.blocks[0].lhs == ["q"],
+              f"function 之外的 always 要照常画：{[(b.lhs, b.origin) for b in m.blocks]}")
 
     # ---------------- 4. 显式敏感列表 ----------------
     m = design.modules.get("sens_test")
@@ -94,6 +291,7 @@ def main() -> int:
     out_dir = ROOT / "build" / "_sch_check"
     made = sch.render_design(design, out_dir, "sch_top")
     print(f"  生成 {len(made)} 个 SVG")
+    svg_text: dict[str, str] = {}
     for p in made:
         check(p.exists(), f"{p} 没生成")
         if not p.exists():
@@ -148,6 +346,7 @@ def main() -> int:
                       f"{p.name}: 文字 {s!r} 可能溢出画布（{tx + est:.0f} > {w:.0f}）")
                 if "warn" in (el.get("class") or ""):
                     warn_texts.append((float(el.get("y", 0)), s))
+                svg_text[p.name] = svg_text.get(p.name, "") + s + "\n"
 
         # 警示文字不能压在图形上。（曾经把提示统一画在固定 y，结果正好盖住
         # 顶层模块框：两边都看不清，而 SVG 完全合法、坐标也没出界 ——
@@ -160,6 +359,33 @@ def main() -> int:
                       f"{p.name}: 警示文字 {s[:18]!r} (y={ty:.0f}) 压在 "
                       f"rect (y={ry:.0f}..{ry + rh:.0f}) 上")
 
+    # ---------------- 7. 解析结果真的画到图上了吗 ----------------
+    # 上面的断言都停在 Module 数据结构上。解析对了但没画出来（或者
+    # 画出来的是旧文案）是同一种失败的另一半，必须端到端再验一次 ——
+    # 这正是 lesson.py 那次"文件都在、内容却是空的"踩过的坑。
+    t = svg_text.get("module_gen_test.svg", "")
+    check("×4" in t,
+          f"module_gen_test.svg 上应标出这条 assign 代表 4 份（×4），实际内容里没有")
+    check("generate g" in t,
+          f"module_gen_test.svg 上应标出 generate 的出处，实际内容里没有")
+    check("展开了 4 份" in t,
+          f"module_gen_test.svg 上应说明展开了几份，实际内容里没有")
+
+    t = svg_text.get("module_gen_macro_test.svg", "")
+    check("[N-1:0]" in t,
+          f"module_gen_macro_test.svg 上位宽算不出来时应照抄源码原文 `[N-1:0]`，"
+          f"实际内容里没有")
+    check("算不出来" in t,
+          f"module_gen_macro_test.svg 上必须写明这块没画以及为什么，实际内容里没有")
+
+    t = svg_text.get("module_gen_if_test.svg", "")
+    check("没画" in t,
+          f"module_gen_if_test.svg 上必须写明另一支没画（否则读者以为源码里没有它），"
+          f"实际内容里没有")
+
+    t = svg_text.get("module_gen_inst_test.svg", "")
+    check("×4" in t, f"module_gen_inst_test.svg 上应标出例化合并成了 4 份")
+
     print()
     if fails:
         for f in fails:
@@ -167,9 +393,12 @@ def main() -> int:
         print(f"\n结构图检查未通过：{len(fails)} 项")
         return 1
     print("  ✓ 数字字面量未变成信号；括号内的比较未被当作赋值")
-    print("  ✓ generate / 显式敏感列表按预期进 unsupported")
+    print("  ✓ generate 能算出来的展开（含嵌套/参数化位宽/例化），算不出来的拒绝")
+    print("  ✓ if generate 只画成立的一支，另一支写进说明")
+    print("  ✓ 显式敏感列表按预期进 unsupported")
     print("  ✓ 例化输出被认作驱动；三层层次 tb→mid→leaf 正确")
     print("  ✓ SVG 合法 XML、坐标在画布内、文字不溢出")
+    print("  ✓ 展开份数 / 出处 / 参数化位宽真的画到了图上")
     print("\n结构图检查通过")
     return 0
 

@@ -69,8 +69,19 @@ def _gh_url(src: dict) -> str:
 # ---------------------------------------------------------------- 下载
 
 
-def _download_once(url: str, part: Path) -> None:
-    """一次下载尝试，从 part 的现有长度续传。失败会抛异常，part 保留。"""
+class TruncatedDownload(OSError):
+    """连接没报错，但读到的字节数少于服务端声明的长度。
+
+    刻意继承 OSError，好让 download() 的既有重试分支顺手接住它 —— 截断跟
+    "连接被掐断"是同一件事，处理方式也该一样：保留 .part，下次从这里续传。
+    """
+
+
+def _download_once(url: str, part: Path) -> int | None:
+    """一次下载尝试，从 part 的现有长度续传。失败会抛异常，part 保留。
+
+    返回服务端声明的**总长度**（拿不到就是 None），供调用方复核。
+    """
     resume_from = part.stat().st_size if part.is_file() else 0
     headers = {"User-Agent": "verilog-learning-setup/1.0"}
     if resume_from:
@@ -78,10 +89,15 @@ def _download_once(url: str, part: Path) -> None:
 
     req = urllib.request.Request(url, headers=headers)
     with urllib.request.urlopen(req, timeout=DOWNLOAD_TIMEOUT) as resp:
-        total = resp.headers.get("Content-Length")
-        total = int(total) + resume_from if total else 0
-        # 只有服务端真按 Range 返回 206 才能续写，否则得从头来
+        # 只有服务端真按 Range 返回 206 才能续写，否则得从头来。
+        # ★ 先定 mode 再算 total，顺序不能反：服务端可能**无视 Range 返回 200**
+        #   （Content-Length 是整份长度），这时若照旧把它加上 resume_from，
+        #   读满也会判成截断 —— 修一个 bug 造一个 bug。
         mode = "ab" if resume_from and resp.status == 206 else "wb"
+        decl = resp.headers.get("Content-Length")
+        total = 0
+        if decl:
+            total = int(decl) + (resume_from if mode == "ab" else 0)
         done = resume_from if mode == "ab" else 0
 
         t0 = time.time()
@@ -103,6 +119,43 @@ def _download_once(url: str, part: Path) -> None:
                     )
     print()
 
+    # ★ 这一段是必需的，不是保险。resp.read() 在「连接被掐断」和「文件正常读完」
+    #   两种情况下**都返回空串**，循环都 break，函数都正常返回 —— 不比对就等于
+    #   把截断当成功。2026-09-29 实测栽过：572 MB 的 oss-cad-suite 下到 540 MB
+    #   被掐断，.part 照样改名成正式文件、退出码 0，少 32 MB 谁也不知道；
+    #   上一版唯一的防线是下面那个 gzip 魔数检查，而魔数在前两个字节就写对了。
+    #   这是拿 found 当 usable，跟 lint.ran / n_warnings=0 是同一个坑。
+    if total and done != total:
+        raise TruncatedDownload(
+            f"连接提前结束：读到 {done} 字节，服务端声明 {total} 字节"
+            f"（差 {total - done} 字节）。.part 保留，下次续传。"
+        )
+    return total or None
+
+
+# 清单里的 size_mb 是四舍五入到 0.1 MB 的，留 1 MB 余量足够吸收舍入误差，
+# 又远小于任何一种真实截断（实测那次差 32 MB）。
+SIZE_SLACK = 1 * 1024 * 1024
+
+
+def _size_shortfall(path: Path, src: dict) -> str | None:
+    """文件比清单声明的体积小了不止一点 → 返回人话说明；否则 None。
+
+    只查"小了"不查"大了"：rolling tag 的同名资产体积会变，往上比会误报。
+    清单没写 size_mb 就返回 None（不猜）。
+    """
+    mb = src.get("size_mb")
+    if not mb:
+        return None
+    expect = int(float(mb) * 1024 * 1024)
+    actual = path.stat().st_size
+    if actual >= expect - SIZE_SLACK:
+        return None
+    return (
+        f"只有 {actual / 1048576:.1f} MB，清单声明 {mb} MB "
+        f"（少了 {(expect - actual) / 1048576:.1f} MB）"
+    )
+
 
 def download(sw, dest_dir: Path, verbose: bool = True) -> Path:
     """下载到 dest_dir。支持断点续传 + 失败重试。返回落盘路径。
@@ -120,9 +173,19 @@ def download(sw, dest_dir: Path, verbose: bool = True) -> Path:
     part = target.with_suffix(target.suffix + ".part")
 
     if target.is_file() and target.stat().st_size > 1_000_000:
+        # ★ 缓存命中也要复核大小。上面那个 1 MB 只是"不像个错误页面"，
+        #   不足以说明文件是完整的：截断到一半的 540 MB 同样 > 1 MB。
+        #   这里拿清单里的 size_mb 当**下界**（只查"小了"，不查"大了"）——
+        #   size_mb 是四舍五入到 0.1 MB 的，且 bucket-* 是滚动 tag 体积会变，
+        #   往上比会误报，往下比才是真的坏了。
+        short = _size_shortfall(target, src)
+        if short is None:
+            if verbose:
+                print(f"  [跳过] 已下载 {src['asset']}")
+            return target
         if verbose:
-            print(f"  [跳过] 已下载 {src['asset']}")
-        return target
+            print(f"  [重下] 缓存里的 {src['asset']} {short}")
+        target.replace(target.with_suffix(target.suffix + ".part"))
 
     url = _gh_url(src)
     if verbose:
@@ -150,6 +213,16 @@ def download(sw, dest_dir: Path, verbose: bool = True) -> Path:
             f"下载在 {DOWNLOAD_RETRIES} 次尝试后仍失败（已下 {kb} KB，"
             f"下次运行会从这里续传）：{type(last).__name__}: {last}"
         ) from last
+
+    # 兜底：Content-Length 缺失（分块传输）时上面那道精确比对不成立，
+    # 这时清单里的 size_mb 是唯一的尺子。宁可判"下坏了"让它续传，
+    # 也不要把半截包交给解压 —— 解压到一半失败，报的会是 tar 的错，
+    # 看起来像归档损坏，实际是下载没完。
+    short = _size_shortfall(part, src)
+    if short is not None:
+        raise RuntimeError(
+            f"{src['asset']} 下载不完整：{short}。.part 保留，重跑会续传。"
+        )
 
     # 校验下载内容真的是压缩包，防止把 404 页面当成工具装进去。
     # setup_toolchain.py 那边查的是 MZ（exe），这里查 gzip / zip 魔数。
@@ -311,7 +384,53 @@ def _merge_into(src: Path, dst: Path) -> int:
 # ---------------------------------------------------------------- 安装
 
 
-def install_one(sw, verbose: bool = True, lock: bool = False) -> tuple[bool, str]:
+def _already_installed(sw) -> tuple[bool, str]:
+    """已经装好且**能证明**吗？返回 (是否短路, 说明给人看)。
+
+    ★ 为什么非要有这个：setup_tools 原先每次调用都完整解压一遍。
+    2026-09-29 跑 `--install yosys --lock` 就白解压了 16953 个条目、白写 2 GB ——
+    不报错，只是慢，最难发现的那种浪费。setup_toolchain.py 早就有这个短路
+    （CLAUDE.md 写着「工具链就位时直接短路、绝不重装」），setup_tools 一直没有。
+
+    ★ 判据是「能证明」，不是「目录在」。没有 check.exe 的条目（oss-utils 之类）
+    探测不出任何东西，probe 的 found 只反映「安装目录存在」——拿它短路，
+    就等于把「证明不了」当成「已经装好」，正是本仓库反复在防的那件事。
+
+    但也不能反过来「证明不了就每次都重装」——那要白解压 2 GB，而这两个条目
+    根本不单独安装，它们随整包一起来。取舍是：**照样短路，但话必须说弱**，
+    印「目录在，证明不了」而不是「自检通过」。判据弱一档，措辞就得弱一档。
+    """
+    if sw.check_exe:
+        pr = probe(sw)
+        if pr.found and pr.usable:
+            ver = f"  {pr.version}" if pr.version else ""
+            return True, f"{sw.name} 已安装且自检通过，跳过{ver}（要重装加 --force）"
+        return False, ""
+
+    # 没有可执行文件可探测的条目（公共库 / 公共资源）。只能看安装目录在不在。
+    #
+    # ★ 证据强度不一样，**话就不能一样**：这里印的是「目录非空」，
+    #   不是「自检通过」。混成同一句话，就是把 found 当 usable，
+    #   而这两条恰好共用 .tools/oss —— 目录存在只是因为 yosys 在那儿。
+    #   但也不该反过来「因为证明不了就每次都重装」：那要白白解压 2 GB，
+    #   而这两个条目根本不会单独安装（它们随整包一起来）。
+    dest = sw.install_dest
+    if dest and dest.is_dir():
+        try:
+            if any(dest.iterdir()):
+                return True, (
+                    f"{sw.name} 的安装目录 {dest} 非空，跳过 —— "
+                    f"⚠ 这条没有 check.exe，**只是目录在，证明不了组件真的装了**"
+                    f"（要重装加 --force）"
+                )
+        except OSError:
+            return False, ""
+    return False, ""
+
+
+def install_one(
+    sw, verbose: bool = True, lock: bool = False, force: bool = False
+) -> tuple[bool, str]:
     """装一个软件。返回 (是否成功, 说明)。"""
     method = sw.raw.get("install", {}).get("method", "")
     dest = sw.install_dest
@@ -323,10 +442,28 @@ def install_one(sw, verbose: bool = True, lock: bool = False) -> tuple[bool, str
     if not dest:
         return False, f"{sw.id} 没写 install.dest，无法确定安装位置"
 
+    if not force:
+        skip, why = _already_installed(sw)
+        if skip:
+            if verbose:
+                print(f"  [跳过] {why}")
+            return True, why
+
     archive = download(sw, CACHE_DIR, verbose)
     digest = sha256_of(archive)
+
+    src = sw.raw.get("source", {})
+    if not force:
+        problem = _lock_problem(sw.id, src, digest)
+        if problem:
+            # 拒绝装，而不是装完再警告。锁的作用就是在**装上之前**拦住，
+            # 装完再说「其实这份不对」已经晚了——坏的工具已经在 .tools/ 里了。
+            return False, problem
     if lock:
-        _write_lock(sw.id, sw.raw.get("source", {}), digest)
+        old = _read_lock().get(sw.id) or {}
+        if old.get("sha256") and old.get("sha256") != digest and old.get("asset") == src.get("asset"):
+            print(f"  [警告] 覆盖锁记录：{old['sha256'][:16]}… -> {digest[:16]}…")
+        _write_lock(sw.id, src, digest)
 
     # 解压到**暂存目录**再剥包裹层，最后合并进安装目录。
     #
@@ -401,13 +538,58 @@ def _install_pip(sw, verbose: bool = True) -> tuple[bool, str]:
     return True, f"{sw.name} 已装入 {venv_dir}（仓库私有，未影响系统 Python）"
 
 
+def _read_lock() -> dict:
+    """读锁文件。坏了就当空的——但**要说出来**，不能静默降级。
+
+    静默降级在这里格外危险：锁坏了 → 读到空 → 校验全部"通过"，
+    而实际情况是一个字节都没查。和 check_manifest 负例 1 是同一类坑。
+    """
+    if not LOCK_PATH.is_file():
+        return {}
+    try:
+        data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"  [警告] {LOCK_PATH.name} 不是合法 JSON（{exc}），锁校验这次全部跳过",
+              file=sys.stderr)
+        return {}
+    if not isinstance(data, dict):
+        print(f"  [警告] {LOCK_PATH.name} 顶层不是对象，锁校验这次全部跳过",
+              file=sys.stderr)
+        return {}
+    return data
+
+
+def _lock_problem(sid: str, src: dict, digest: str) -> str | None:
+    """比对锁记录与这次实算的 sha256。返回问题描述；没问题或没记录返回 None。
+
+    ★ 这个方法存在的理由：`--lock` 的文档一直写着「记下 sha256，之后靠它校验」，
+    但在 2026-09-29 之前**全仓库没有任何代码读这个文件**——锁只写不读，
+    是一张没人查的收据。而那一周刚刚发生过一次静默截断（572 MB 下到 540 MB
+    照样报成功），锁本来就是防这个的。
+    """
+    entry = _read_lock().get(sid)
+    if not entry:
+        return None
+    recorded = entry.get("sha256")
+    if not recorded:
+        return f"锁里 {sid} 那条没有 sha256 字段"
+    # 资产换了（例如分组件 → 整包）就没有可比性：记录的是另一份文件。
+    # 这不是错误，但也不能算"校验通过"，得说清楚。
+    if entry.get("asset") != src.get("asset"):
+        return None
+    if recorded == digest:
+        return None
+    return (
+        f"{src.get('asset')} 的 sha256 与锁里记的不一致：\n"
+        f"        锁里：{recorded}\n"
+        f"        实算：{digest}\n"
+        f"        同名资产内容变了（滚动 tag 每天覆盖），或下载被篡改/截断。\n"
+        f"        确认要接受新的这份就加 --force。"
+    )
+
+
 def _write_lock(sid: str, src: dict, digest: str) -> None:
-    data = {}
-    if LOCK_PATH.is_file():
-        try:
-            data = json.loads(LOCK_PATH.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            data = {}
+    data = _read_lock()
     data[sid] = {
         "repo": src.get("repo"),
         "tag": src.get("tag"),
@@ -426,21 +608,119 @@ def _write_lock(sid: str, src: dict, digest: str) -> None:
 def do_list(manifest) -> int:
     probes = {s.id: probe(s) for s in manifest.software}
     print(f"清单版本 {manifest.schema}（更新于 {manifest.updated}）\n")
-    print(f"{'id':<22} {'名称':<24} {'状态':<10} {'体积':>9}  Windows 可得性")
+    # ★ 多条指向同一个归档时，体积只在**第一条**打印，其余标成"↳ 同上"。
+    #   否则整包里的 7 个工具每个都显示 572.2 MB，读起来像要下 7 次 ——
+    #   实际 do_install 按 (repo,tag,asset) 判重，只解压一次。
+    #   体积列的含义是「装它要下多少」，不是「它自己多大」。
+    from _manifest import WINDOWS_LABEL
+
+    asset_owner: dict[tuple, str] = {}
+    groups: dict[tuple, list[str]] = {}
+    for sw in manifest.software:
+        src = sw.raw.get("source", {})
+        if src.get("asset"):
+            groups.setdefault(
+                (src.get("repo"), src.get("tag"), src.get("asset")), []
+            ).append(sw.id)
+
+    print(f"{'id':<22} {'名称':<24} {'状态':<10} {'下载量':>9}  Windows 可得性")
     print("─" * 100)
+    unprovable: list[str] = []
     for sw in manifest.software:
         p = probes[sw.id]
-        state = "已安装 ✓" if p.found else "未安装"
-        size = f"{sw.size_mb} MB" if sw.size_mb else "—"
-        from _manifest import WINDOWS_LABEL
+        if not sw.check_exe:
+            # ★ 没有 check.exe 时 probe 的 found 只反映「安装目录存在」，
+            #   它的 detail 自己都写着「不能证明组件真的装了」。
+            #   这种条目印成「已安装 ✓」就是把免责声明丢掉、只留结论。
+            state = "未知 ?" if p.found else "未安装"
+            if p.found:
+                unprovable.append(sw.id)
+        else:
+            state = "已安装 ✓" if p.found else "未安装"
+        src = sw.raw.get("source", {})
+        key = (src.get("repo"), src.get("tag"), src.get("asset"))
+        if src.get("asset") and key in asset_owner:
+            size = f"↳{asset_owner[key]}"
+        else:
+            size = f"{sw.size_mb} MB" if sw.size_mb else "—"
+            if src.get("asset"):
+                asset_owner[key] = sw.id
 
         print(f"{sw.id:<22} {sw.name:<24} {state:<10} {size:>9}  {WINDOWS_LABEL.get(sw.windows, sw.windows)}")
+    # 只报**真的**有多方共用的那几组。按 key 分组再筛 len>1，
+    # 别拿 asset_owner.values() 当"共用者"——那是所有归档的拥有者，
+    # 会把 mingw / slang / verible 这些独占自己归档的条目也列进去。
+    for key, ids_in_group in groups.items():
+        if len(ids_in_group) > 1:
+            print(f"\n注：{', '.join(ids_in_group)} 共用同一个归档（{key[2]}），"
+                  f"安装时只下载、只解压一次。")
+    if unprovable:
+        print(f"\n注：{', '.join(unprovable)} 显示「未知 ?」是因为它们没有可执行文件可探测，"
+              f"只能看到安装目录在不在——**目录在 ≠ 组件真的装了**。")
     print("\n安装：python tools/setup_tools.py --install <id> [<id>...]")
     print("体检：python tools/check_tools.py --level L2")
     return EXIT_OK
 
 
-def do_install(manifest, ids: list[str], verbose: bool, lock: bool) -> int:
+def do_verify_lock(manifest) -> int:
+    """把缓存里的归档与锁里记的 sha256 对一遍。
+
+    ★ 三类结果必须**分开报**，尤其是后两类：`n_ok` / `n_bad` / `n_unknown`。
+    「缓存里没有这份归档」既不是通过也不是失败——把它并进任何一边都是谎报：
+    并进 ok 就是拿"没查"冒充"查过了"，并进 bad 就是拿"没查"冒充"坏了"。
+    和 lint.ran / n_warnings、cov 的 no_cover / 0 分是同一个教训。
+    """
+    data = _read_lock()
+    if not data:
+        print(f"{LOCK_PATH.name} 里一条记录都没有。**这不是「校验通过」**，"
+              f"是压根没有可校验的东西。\n"
+              f"（装工具时加 --lock 才会记；锁记录的是「这个归档的 sha256 应该是多少」）")
+        return EXIT_OK
+
+    # asset -> 用它的那些 id 的**集合**。不能是单个 id：整包那次之后，
+    # 有 7 条指向同一个归档，只留最后一个的话，其余 6 条会被误报成「锁过期」。
+    manifest_assets: dict[str, set[str]] = {}
+    for s in manifest.software:
+        a = s.raw.get("source", {}).get("asset")
+        if a:
+            manifest_assets.setdefault(a, set()).add(s.id)
+    n_ok = n_bad = n_unknown = 0
+    print(f"校验 {LOCK_PATH.name}（{len(data)} 条）\n")
+    for sid, entry in sorted(data.items()):
+        asset = entry.get("asset")
+        want = entry.get("sha256") or ""
+        if not asset:
+            print(f"  ? {sid:24} 锁里没写 asset，无从校验")
+            n_unknown += 1
+            continue
+        users = manifest_assets.get(asset)
+        if users is not None and sid not in users:
+            print(f"  ! {sid:24} 锁指着 {asset}，而清单里这份只归 "
+                  f"{', '.join(sorted(users))} —— 锁过期了")
+        archive = CACHE_DIR / asset
+        if not archive.is_file():
+            print(f"  ? {sid:24} 缓存里没有 {asset}，**无法校验**（不是通过）")
+            n_unknown += 1
+            continue
+        got = sha256_of(archive)
+        if got == want:
+            print(f"  ✓ {sid:24} {got[:16]}…")
+            n_ok += 1
+        else:
+            print(f"  ✗ {sid:24} 锁里 {want[:16]}…  实际 {got[:16]}…")
+            n_bad += 1
+
+    print(f"\n通过 {n_ok}，不一致 {n_bad}，无法校验 {n_unknown}")
+    if n_bad:
+        print("不一致意味着同名资产的内容变了（滚动 tag 每天覆盖），或下载被篡改/截断。")
+        return EXIT_FAIL
+    if n_unknown and not n_ok:
+        print("一条都没校验成——别把这次结果读成「锁是干净的」。")
+    return EXIT_OK
+
+
+def do_install(manifest, ids: list[str], verbose: bool, lock: bool,
+               force: bool = False) -> int:
     by_id = {s.id: s for s in manifest.software}
     unknown = [i for i in ids if i not in by_id]
     if unknown:
@@ -449,23 +729,38 @@ def do_install(manifest, ids: list[str], verbose: bool, lock: bool) -> int:
         return EXIT_USAGE
 
     ok_count = fail_count = 0
+    # ★ 同一个归档只装一次。清单里 yosys / verilator / oss-utils /
+    #   oss-system-resources 四项**指向同一个整包**（都往 .tools/oss 里放东西），
+    #   不去重就会把同一份 16953 条目的 tgz 解压四遍、往磁盘写四遍 2 GB。
+    #   它不报错，只是白干——正是最不容易被发现的那种浪费。
+    #   按 (repo, tag, asset) 判重，不按 id：判的是"是不是同一份文件"。
+    done_assets: dict[tuple, str] = {}
     for sid in ids:
         sw = by_id[sid]
         print(f"\n── {sw.name} ({sid}) " + "─" * 40)
+        src = sw.raw.get("source", {})
+        key = (src.get("repo"), src.get("tag"), src.get("asset"))
+        if src.get("asset") and key in done_assets:
+            print(f"  [跳过] 与 {done_assets[key]} 是同一个归档（{src['asset']}），不重复解压")
+            ok_count += 1
+            continue
         try:
-            ok, msg = install_one(sw, verbose, lock)
+            ok, msg = install_one(sw, verbose, lock, force)
         except (urllib.error.URLError, OSError, RuntimeError) as exc:
             ok, msg = False, f"失败：{type(exc).__name__}: {exc}"
         print(("  ✓ " if ok else "  ✗ ") + msg)
         ok_count += ok
         fail_count += not ok
+        if ok and src.get("asset"):
+            done_assets[key] = sid
 
     print(f"\n完成：{ok_count} 成功，{fail_count} 失败")
     print("装完请跑：python tools/check_tools.py --level L2")
     return EXIT_OK if fail_count == 0 else EXIT_FAIL
 
 
-def do_for_level(manifest, level: str, verbose: bool, lock: bool) -> int:
+def do_for_level(manifest, level: str, verbose: bool, lock: bool,
+                 force: bool = False) -> int:
     from _manifest import summarize_for_level
 
     probes = {s.id: probe(s) for s in manifest.software}
@@ -475,7 +770,7 @@ def do_for_level(manifest, level: str, verbose: bool, lock: bool) -> int:
         print(f"{level} 没有缺失项，无需安装。")
         return EXIT_OK
     print(f"{level} 缺 {len(summary['unmet'])} 项能力，需要这些软件：{', '.join(ids)}\n")
-    return do_install(manifest, ids, verbose, lock)
+    return do_install(manifest, ids, verbose, lock, force)
 
 
 # ---------------------------------------------------------------- CLI
@@ -493,11 +788,15 @@ def main(argv: list[str] | None = None) -> int:
             "  python tools/setup_tools.py --for-level L2\n"
         ),
     )
-    g = ap.add_mutually_exclusive_group(required=True)
+    g = ap.add_mutually_exclusive_group(required=False)
     g.add_argument("--list", action="store_true", help="列出清单里的软件与安装状态")
     g.add_argument("--install", nargs="+", metavar="ID", help="安装指定的软件")
     g.add_argument("--for-level", choices=["L1", "L2", "L3"], help="装某一级别缺失能力所需的软件")
     ap.add_argument("--lock", action="store_true", help="记录 sha256 到 .tools/tools.lock.json")
+    ap.add_argument("--verify-lock", action="store_true",
+                    help="把缓存里的归档与锁里记的 sha256 对一遍，不一致就退出码非 0")
+    ap.add_argument("--force", action="store_true",
+                    help="无视「已安装」短路与锁记录，强制重装（会覆盖锁）")
     ap.add_argument("--quiet", action="store_true", help="少打印")
     args = ap.parse_args(argv)
 
@@ -513,11 +812,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {p}", file=sys.stderr)
         return EXIT_ENV
 
+    if args.verify_lock:
+        return do_verify_lock(manifest)
     if args.list:
         return do_list(manifest)
     if args.for_level:
-        return do_for_level(manifest, args.for_level, not args.quiet, args.lock)
-    return do_install(manifest, args.install, not args.quiet, args.lock)
+        return do_for_level(manifest, args.for_level, not args.quiet, args.lock, args.force)
+    if args.install:
+        return do_install(manifest, args.install, not args.quiet, args.lock, args.force)
+    ap.print_help()
+    return EXIT_USAGE
 
 
 if __name__ == "__main__":

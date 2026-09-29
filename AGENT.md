@@ -45,12 +45,44 @@ python tools/sim.py <设计.v> --tb <测试台.v> --top <顶层>
 # 判定 + 出波形和结构图（学习者想看"长什么样"时）
 python tools/viz.py <设计.v> --tb <测试台.v> --top <顶层> --open
 
+# 参数化批量回归（一讲里要扫一组参数时）
+python tools/regress.py <设计.v> --tb <测试台.v> --top <顶层> --param WIDTH=4,8
+
+# 综合 / 资源估算 / 门级网表（讲"这段代码综合成什么"时）
+python tools/synth.py <设计.v> --top <顶层> --compare bin,onehot,gray
+python tools/synth.py <设计.v> --top <顶层> --netlist
+
+# 功能覆盖率合并（多份测试台覆盖同一批覆盖点时）
+python tools/cov.py build/sim/a.json build/sim/b.json
+
+# 逐位翻转计数（讲"状态编码省不省电"时 —— 综合器量不出这个）
+python tools/toggle.py build/bin.vcd build/gray.vcd --signal st
+
 # 工具体检（开课前跑一次，把缺什么翻译给学习者）
 python tools/check_tools.py --level L2
 
 # 为课程材料生成完整产物包（出解答时用，不是学习时用）
 python tools/lesson.py L1-05
 ```
+
+★ **转述这四个入口的结果时，别把「没做」和「做了但结果为零」说成一回事**：
+`regress` 的 `n_combos` / `synth` 的 `n_sizer_ok` / `cov` 的 `n_runs_with_cover` /
+`toggle` 的 `n_changes`（变化次数，与 `total_bit_toggles` 翻位数分开）
+都是**和总数分开报的第二个数**。覆盖率合并**只能取并集不能取平均**——
+平均会在两个方向上都错，高报那一侧尤其危险（看着挺勤快）。
+
+**讲状态编码时必须两个数都讲**，因为它们回答的是两个问题：
+
+- `synth.py` → **面积**（几个触发器、多少门）。sizer 对"状态寄存器变宽"敏感
+  （独热 4 FF），对"同宽度下换编码"**完全不敏感**（bin 和 gray 都是 2 FF / 21 门）。
+- `toggle.py` → **翻转**（动态功耗的代理量）。这才是格雷真正的卖点，而
+  **yosys 也不量这个**——综合器不做活动性分析，不知道哪些跳变是"热的"。
+
+★ 翻转数**完全由激励决定**。`toggle.py` 会先验可比性（两份波形里状态寄存器的
+变化时刻必须逐项相等），不可比时 `not_comparable` 并**拒绝给比值**——
+**别把那个 null 说成"没差别"**。看到 `identical_inputs` 则说明两份波形内容一模一样，
+通常意味着 `--param` 没接上或产物被覆盖了。
+**"打平"和"没数到"（`no_toggles`，全是 0）是两回事**，前者是真结论，后者是没在工作。
 
 `sim.py` 的 stdout **只有一个 JSON**，人类可读摘要走 stderr。
 程序读 stdout，跟学习者说话用你自己组织的话。
@@ -177,6 +209,10 @@ agent 把「写码 → 立刻出波形」做得太顺滑，学习者会永久跳
 | `gap: "software"` | 「这个能力需要装 X（约 200MB）。要装吗？不装的话这部分只能讲原理。」 |
 | `gap: "code"` | 「这个功能本仓库还没实现，装什么工具都没用。」 |
 | `unavailable_software`（WSL-only） | 「STA / CDC / DFT / 功耗这几项在 Windows 原生跑不了。我可以讲原理、带你手算 slack、读报告样例，但**我不能说'验证过了'**。」 |
+
+> `gap: "code"` 那一行现在**没有能力落在里面**——25 项能力只剩 `none` 和 `software` 两种。
+> 剩下的缺口（yosys / verilator / mingw / sby…）**卡口是软件本身，不是仓库欠代码**。
+> 这行留着是因为它描述的是**机制**：将来要加的新能力，没实现完就得诚实地标成 `code`。
 
 **最后一行是最要紧的。** 环境越流畅，越容易顺手编一个"看起来对"的结果出来。
 在这个仓库里，老实说「这个我跑不了，只能手算」永远比含糊过去强。

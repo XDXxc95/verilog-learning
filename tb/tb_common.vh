@@ -11,6 +11,12 @@
 //    TEST_DONE
 //    TEST_TIMEOUT  limit=<n>             （协作式超时触发时打印）
 //
+//  覆盖点（可选，见文件末尾）：
+//    TEST_COVER_DECL  name=<覆盖点>      （声明一个要求验到的场景）
+//    TEST_COVER_HIT   name=<覆盖点>      （该场景真的跑到了）
+//  ★ 这两个**不是判定标记**：只有它们、没有 TEST_PASS/FAIL 时，sim.py 仍判
+//    「没判定」。覆盖点不进 status，它回答的是"测得够不够深"。
+//
 //  为什么用 === 而不是 == ：
 //    x/z 参与 == 比较时结果是 x，if 会走 else 分支，但你看不出为什么。
 //    === 是"完全相同"比较，x 与 x 相等，结果永远是确定的 0 或 1。
@@ -192,6 +198,39 @@
             vlearn_begin(vx_label);                                        \
             if ((vx_exp) === (vx_act)) `VLEARN_PASS                        \
             else                       `VLEARN_FAIL_B(vx_exp, vx_act)      \
+        end
+
+    // ---------------------------------------------------------------- 功能覆盖点
+    //
+    // 覆盖点和"用例过没过"是两件事，别混：
+    //   用例过没过 —— 待测模块**对不对**（判定，进 status）
+    //   覆盖点     —— 测试台**测得全不全**（观察，不进 status）
+    // 用例全过但覆盖有洞，说明测得太浅，不代表模块写错了。反过来，
+    // 覆盖打满也不代表模块对——覆盖点是你自己声明的，声明漏了就是自欺。
+    // sim.py 把结果放在 JSON 的 cover 块里，并且写死 affects_verdict=false。
+    //
+    // 用法：**先声明、再在真正跑到那个场景时打命中**。
+    //     `VLEARN_COVER_DECL("rst_during_count")   // 写在模块级或 initial 开头
+    //     ...
+    //         // 下面这段激励就是在测「计数过程中复位」
+    //         `VLEARN_COVER_HIT("rst_during_count")
+    //
+    // 声明是给"没打到的点"留分母的。只写 HIT 不写 DECL 的话，sim.py 算不出
+    // 覆盖率（它会在 cover.undeclared_hits 里如实说"有命中没声明"，
+    // 不会假装覆盖齐全）。
+    //
+    // 参数名必须是 vx_point，不能写成 name —— 否则下面格式串里的 "name="
+    // 会被替换成参数值（见文件头说明，iverilog 连引号里都替换）。
+    `define VLEARN_COVER_DECL(vx_point)                                    \
+        begin                                                              \
+            $display("TEST_COVER_DECL name=%0s", vx_point);                \
+            $fflush;                                                       \
+        end
+
+    `define VLEARN_COVER_HIT(vx_point)                                     \
+        begin                                                              \
+            $display("TEST_COVER_HIT name=%0s", vx_point);                 \
+            $fflush;                                                       \
         end
 
 `endif

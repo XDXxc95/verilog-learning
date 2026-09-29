@@ -1,6 +1,6 @@
 {
   "schema": "vlearn.toolchain/1",
-  "updated": "2026-09-24",
+  "updated": "2026-09-29",
   "about": [
     "本仓库的工具能力清单。两张表互链：",
     "  capabilities[] —— 能力表，给学习者看「这一级缺什么、缺了会怎样」",
@@ -15,14 +15,12 @@
     "数据来源：2026-09-24 经 GitHub API / PyPI JSON API 实测核对（体积、文件名、",
     "是否有 Windows 构建均为接口返回的实物数据）。标注 verified=false 的为未实测项。"
   ],
-
   "impact_levels": {
     "blocks": "整讲做不了——大纲里这一讲的核心动手环节完全落空，必须改大纲",
     "degrades": "动手环节塌掉——主课能上，但该讲的「能真跑」部分退化为讲原理",
     "shrinks": "缩水但主课能上——少一块动手内容，不影响本讲主线",
     "talk_only": "本来只讲——大纲从未承诺能动手，缺工具不构成缺陷"
   },
-
   "software": [
     {
       "id": "iverilog",
@@ -32,9 +30,15 @@
       "verified": true,
       "installed_by": "setup_toolchain.py",
       "provides": [
-        "sim.run", "sim.gate_timing", "synth.netlist.iverilog", "sim.compare"
+        "sim.run",
+        "sim.gate_timing",
+        "synth.netlist.iverilog",
+        "sim.compare"
       ],
-      "check": { "exe": "iverilog", "version_arg": "-V" },
+      "check": {
+        "exe": "iverilog",
+        "version_arg": "-V"
+      },
       "note": "已装于 .tools/iverilog/。iverilog 14.0 + GTKWave 3.3.128，约 110 MB。"
     },
     {
@@ -46,27 +50,37 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-yosys.tgz",
-        "size_mb": 40.7,
-        "rolling": true,
-        "note": "bucket-* 是滚动 tag，每次构建覆盖同名资产。要做可复现安装必须先记录 sha256，否则今天装的和明天装的可能不是同一版本。带日期的 release（如 2026-09-24）是固定的，但只有整包、没有分组件。"
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "★ **必须用整包，不能用分组件资产**（windows-x64-yosys.tgz，42 MB）——后者不是独立发行版，只是给整包做增量覆盖用的。实测把它单独装上：yosys.exe 直接 STATUS_DLL_NOT_FOUND(0xC0000135)；把 bleyer iverilog 的同名 DLL 摆过去顶，变成 STATUS_ENTRYPOINT_NOT_FOUND(0xC0000139)。读 PE 导入/导出表定位到真凶**只有 libstdc++-6.dll 一个**（其余 6 个 DLL 全对得上），缺 273 个符号里的 11 个，而这 11 个分两类：(1) yosys 要的是 std::fpos<int> / std::codecvt<wchar_t,char,int>，即构建时 mbstate_t == int，而本机所有 UCRT 风味的 libstdc++ 导出的都是 std::fpos<_Mbstatet> —— **这是两套 C 库 ABI，换更新的 DLL 也补不上**；(2) __cxa_thread_atexit 与两个 __emutls_v.* 变量（构建时用了 GCC 模拟 TLS）。扫过本机 15 个 libstdc++-6.dll，最好的一个仍差 1 个符号。用**带日期的固定 tag**（不是滚动的 bucket-*），所以可复现；整包是 .tgz，符合本仓库「不运行下载来的可执行文件」的安装规则。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
       "provides": [
-        "synth.run", "synth.area", "synth.encoding",
-        "formal.lec", "formal.prop", "sta.estimate"
+        "synth.run",
+        "synth.area",
+        "synth.encoding",
+        "sta.estimate"
       ],
       "check": {
         "exe": "yosys",
         "version_arg": "-V",
-        "lib_dirs": ["lib"],
+        "lib_dirs": [
+          "lib"
+        ],
         "functional": {
-          "args": ["-p", "read_verilog tools/probe/vlearn_probe.v; synth -top vlearn_probe; stat"],
+          "args": [
+            "-p",
+            "read_verilog tools/probe/vlearn_probe.v; synth -top vlearn_probe; stat"
+          ],
           "note": "真跑一次综合。#1 只查版本号会把「DLL 没配齐、进程根本起不来」判成已安装；#2 这条也顺带验证了读文件与写网表能力。"
         }
       },
-      "note": "yosys 自身的 GitHub releases 只有源码、无 Windows 二进制，Windows 原生版只能走 OSS CAD Suite 的分组件资产。⚠ 实测该组件**不是自包含的**：yosys.exe 依赖 libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1 这一整组 mingw 运行时，而 windows-x64-yosys.tgz 里一个都不带。不补齐时进程直接 STATUS_DLL_NOT_FOUND(0xC0000135) 退出，**任何输出都没有、也没有报错信息**——只看「文件在不在」必然误判。拿 bleyer iverilog 的 msys2 版同名 DLL 顶上会变成 STATUS_ENTRYPOINT_NOT_FOUND(0xC0000139)，ABI 不兼容，不能混用。"
+      "note": "yosys 自身 GitHub releases 只有源码、无 Windows 二进制，Windows 原生版只能走 OSS CAD Suite。**本机装的这一份是完整套件，不是分组件资产**——分组件那条路已实测走不通，原因见 source.note，别再回去试。套件里除 yosys 外还带 verilator / slang / eqy / sby / z3 / gtkwave 等，但本清单只声明 yosys 提供的能力；其余工具要用得先各自过一遍 check（「文件在」不等于「能用」）。\n★ 2026-09-29 已装好并验过：Yosys 0.69+154 (git sha1 30d62572e-dirty)，解压 16953 条目、合并 3563 条目进 .tools/oss，`check_tools.py --level L2` 到 **8/8**，functional 自检真跑了一次 read_verilog→synth→stat。同一次覆盖没把 verilator 换坏（5.053 的 lint 仍然出 Verilation Report）。\n★ 装的过程踩到一个**下载静默截断**的坑，已修进 setup_tools.py：572 MB 下到 540 MB 被掐断，而 http.client 的 read(amt) 遇到连接提前关闭**返回空串、不抛 IncompleteRead**，于是「读完了」和「读断了」在调用方眼里一样，.part 照样改名成正式文件、退出码 0，少 32 MB 无人知晓。原有的 gzip 魔数防线拦不住（魔数在前两字节就对了）——又是拿 found 当 usable。现在比对 Content-Length，短发即抛 TruncatedDownload（OSError 子类，落进既有重试分支），缓存命中时另用清单里的 size_mb 当**下界**兜底。负例见 check_manifest.py 负例 9c（本地 HTTP 服务短发复现）。 ★ 2026-09-29 更正：原先 provides 里还写着 formal.lec / formal.prop，这是拿「相关」冒充「提供」——这两条能力的 requires 是 sby / eqy / z3。yosys 确实在 sby 的流程底下（sby 要调它做综合），但装 yosys 不等于这两条能力可用。关联关系只留在本条 note 里，不进 provides。"
     },
     {
       "id": "verilator",
@@ -77,23 +91,37 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-verilator.tgz",
-        "size_mb": 21.2,
-        "rolling": true
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "★ 2026-09-29 起改为**整包**，不再是分组件资产 windows-x64-verilator.tgz（21.2 MB，bucket-* 滚动 tag）。原因是 yosys 那条路已被证明必须用整包（见 yosys.source.note），而四份分组件共用同一个 .tools/oss —— 既然 yosys 绕不过 572 MB，单独留三份小覆盖层只是名义上的便宜：任何新机器装 L2 都得下整包，那几个 21 MB / 5 MB / 3 MB 的资产不会被单独用到。留着它们反而让 lock 和磁盘上的实际来源对不上。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
-      "provides": ["lint.full", "cov.code", "sva.assert"],
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
+      "provides": [
+        "lint.full",
+        "cov.code",
+        "sva.assert"
+      ],
       "check": {
         "exe": "verilator_bin",
         "version_arg": "--version",
-        "env": { "VERILATOR_ROOT": "${dest}/share/verilator" },
+        "env": {
+          "VERILATOR_ROOT": "${dest}/share/verilator"
+        },
         "functional": {
-          "args": ["--lint-only", "-Wall", "tools/probe/vlearn_probe.v"],
+          "args": [
+            "--lint-only",
+            "-Wall",
+            "tools/probe/vlearn_probe.v"
+          ],
           "note": "真跑一次 lint。--version 在任何情况下都成功，分辨不出 VERILATOR_ROOT 烘死的问题。"
         }
       },
-      "note": "官方 verilator 在 Windows 上只支持 MSYS2/WSL，不发布预编译二进制；但 OSS CAD Suite 的 windows-x64 构建里有真实的 verilator target（工作流中有 windows-x64-verilator job），是原生 mingw-w64 交叉编译的。PyPI 上另有第三方包 dau-dev/verilator-python（5.2 MB），非官方，优先级低于前者。⚠ 套件解压出来的 .tools/oss/bin/verilator 是个 Perl 驱动脚本，本机 git-bash 的 perl 缺 Pod/Usage.pm 跑不起来——可执行的是 verilator_bin.exe，所以 check.exe 指的是它而不是 verilator。",
+      "note": "官方 verilator 在 Windows 上只支持 MSYS2/WSL，不发布预编译二进制；但 OSS CAD Suite 的 windows-x64 构建里有真实的 verilator target（工作流中有 windows-x64-verilator job），是原生 mingw-w64 交叉编译的。PyPI 上另有第三方包 dau-dev/verilator-python（5.2 MB），非官方，优先级低于前者。⚠ 套件解压出来的 .tools/oss/bin/verilator 是个 Perl 驱动脚本，本机 git-bash 的 perl 缺 Pod/Usage.pm 跑不起来——可执行的是 verilator_bin.exe，所以 check.exe 指的是它而不是 verilator。\n★ 2026-09-29 整包覆盖后实测仍可用：verilator_bin 5.053，`--lint-only -Wall` 正常出 Verilation Report。",
       "caveat": "verilator 分两条路，成本差很多，别混为一谈：(1) --lint-only 纯静态检查，装完就能用，lint.full 属于这条；(2) --binary/--cc 真正编译出仿真模型，需要 C++ 编译器 + make，才会带来覆盖率（cov.code）和并发断言（sva.assert）。⚠ 实测结论：#2 的瓶颈**不是 make，是编译器**。用本机唯一的 g++（Qt 自带 mingw 7.3，2017 年）逐层试过，make 那步可以拿 mingw32-make 顶替（verilator 认 MAKE 环境变量），但之后连撞四个跟编译器太旧有关的问题：-fcf-protection=none 不认（GCC 8+ 才有）、verilated.mk 里 python3 找不到、GetProcessMemoryInfo 缺 -lpsapi、最后链接报 WinMain 未定义。而这个 verilator 是按 GCC 15.2.1 配置的（verilated.mk 里 CFG_CXX_VERSION 写着）。结论：要打通必须换现代 mingw-w64（见 mingw 条目，约 250 MB），单独补一个 make 解决不了问题。"
     },
     {
@@ -111,8 +139,16 @@
         "rolling": false,
         "note": "固定版本 tag，可复现。⚠ 250 MB 起，是本清单里最大的一项，装之前想清楚值不值。它自带 mingw32-make，所以 make 不用另外找。"
       },
-      "install": { "method": "extract-zip", "dest": ".tools/mingw" },
-      "provides": ["toolchain.cc"],
+      "install": {
+        "method": "extract-zip",
+        "dest": ".tools/mingw"
+      },
+      "repo_private": true,
+      "provides": [
+        "toolchain.cc",
+        "sva.assert",
+        "cov.code"
+      ],
       "check": {
         "exe": "g++",
         "version_arg": "--version",
@@ -126,8 +162,8 @@
           "note": "拿 verilator 真正会加的 flag 编一次。只看 --version 会把系统上任何 g++ 都当成合格 —— 本机 PATH 上那个 Qt mingw 7.3 就是这么被误判进来的。"
         }
       },
-      "note": "为什么单列成一项而不是混进 verilator：verilator 的 lint 和它的编译链是两回事，取决于两条不同的依赖（前者零额外依赖，后者要整套编译器）。混在一起写，使用者会以为装了 verilator 就有覆盖率。⚠ 候选里只有 winlibs 给 .zip：niXman/mingw-builds-binaries 只有 .7z（标准库解不了，而本仓库的原则是不运行下载来的可执行文件），skeeto/w64devkit 只有自解压 .7z.exe（同样违反该原则），MSYS2 的包是 .tar.zst（同样解不了）。所以 250 MB 这个体积是被规则卡出来的，不是没找更小的。",
-      "caveat": "装完还得让 verilator 用上它：verilator 调 make 时认 MAKE 环境变量，需要把 MAKE 指向本包的 mingw32-make.exe，并把 bin 放到 PATH。这一步本仓库尚未实现（没有 lcov/覆盖率接入代码），所以现在即使装了也只是「有编译器」，cov.code 依然标着缺口。"
+      "note": "为什么单列成一项而不是混进 verilator：verilator 的 lint 和它的编译链是两回事，取决于两条不同的依赖（前者零额外依赖，后者要整套编译器）。混在一起写，使用者会以为装了 verilator 就有覆盖率。⚠ 候选里只有 winlibs 给 .zip：niXman/mingw-builds-binaries 只有 .7z（标准库解不了，而本仓库的原则是不运行下载来的可执行文件），skeeto/w64devkit 只有自解压 .7z.exe（同样违反该原则），MSYS2 的包是 .tar.zst（同样解不了）。所以 250 MB 这个体积是被规则卡出来的，不是没找更小的。⚠ 本项标了 repo_private：**只认装进 .tools/ 的这份，不用系统 PATH 上的 g++**。编译器的能不能用取决于版本而不是在不在 —— 系统上那个 mingw 7.3 会让 verilator 编出莫名其妙的一串错，而复用它省下的 250 MB 换来的是「查不出原因的失败」。",
+      "caveat": "装完还得让 verilator 用上它：verilator 调 make 时认 MAKE 环境变量，需要把 MAKE 指向本包的 mingw32-make.exe，并把 bin 前置到 PATH。这一步本仓库尚未实现（没有覆盖率接入代码），所以现在即使装了也只是「有编译器」，cov.code 依然标着缺口。"
     },
     {
       "id": "formal",
@@ -138,14 +174,25 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-formal.tgz",
-        "size_mb": 13.5,
-        "rolling": true
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "★ 2026-09-29 起改为**整包**，不再是分组件资产（bucket-* 滚动 tag）。整包已把 sby / eqy / z3 一并带进来，而 yosys 那条路已证明必须用整包（见 yosys.source.note）—— 既然整包绕不过，单独留几份小覆盖层只是名义上的便宜，还会让 lock 与磁盘上的实际来源对不上。清单里多条指向同一个归档是**有意**的：setup_tools.do_install 按 (repo, tag, asset) 判重，同一个归档只解压一次。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
-      "provides": ["formal.prop", "formal.lec", "cdc.formal"],
-      "check": { "exe": "sby", "version_arg": "--version" },
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
+      "provides": [
+        "formal.prop",
+        "formal.lec",
+        "cdc.formal"
+      ],
+      "check": {
+        "exe": "sby",
+        "version_arg": "--version"
+      },
       "note": "依赖 solver（见 z3）。OSS CAD Suite 自带求解器，不用另配，这是它相对自行搭建的最大优势。"
     },
     {
@@ -157,14 +204,23 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-eqy.tgz",
-        "size_mb": 1.4,
-        "rolling": true
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "★ 2026-09-29 起改为**整包**，不再是分组件资产（bucket-* 滚动 tag）。整包已把 sby / eqy / z3 一并带进来，而 yosys 那条路已证明必须用整包（见 yosys.source.note）—— 既然整包绕不过，单独留几份小覆盖层只是名义上的便宜，还会让 lock 与磁盘上的实际来源对不上。清单里多条指向同一个归档是**有意**的：setup_tools.do_install 按 (repo, tag, asset) 判重，同一个归档只解压一次。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
-      "provides": ["formal.lec"],
-      "check": { "exe": "eqy", "version_arg": "--version" },
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
+      "provides": [
+        "formal.lec"
+      ],
+      "check": {
+        "exe": "eqy",
+        "version_arg": "--version"
+      },
       "note": "只有 1.4 MB，是性价比最高的一个——L3-15 的 LEC 从「只能讲概念」变成能动手。"
     },
     {
@@ -176,14 +232,25 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-z3.tgz",
-        "size_mb": 18.4,
-        "rolling": true
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "★ 2026-09-29 起改为**整包**，不再是分组件资产（bucket-* 滚动 tag）。整包已把 sby / eqy / z3 一并带进来，而 yosys 那条路已证明必须用整包（见 yosys.source.note）—— 既然整包绕不过，单独留几份小覆盖层只是名义上的便宜，还会让 lock 与磁盘上的实际来源对不上。清单里多条指向同一个归档是**有意**的：setup_tools.do_install 按 (repo, tag, asset) 判重，同一个归档只解压一次。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
-      "provides": [],
-      "check": { "exe": "z3", "version_arg": "--version" },
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
+      "provides": [
+        "formal.prop",
+        "formal.lec",
+        "cdc.formal"
+      ],
+      "check": {
+        "exe": "z3",
+        "version_arg": "--version"
+      },
       "note": "套件里还有 yices / boolector / bitwuzla / cvc5 / cadical / picosat / lingeling 等多个求解器，按需再装。z3 是最常用的默认后端。"
     },
     {
@@ -195,15 +262,21 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-utils.tgz",
-        "size_mb": 5.2,
-        "rolling": true
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "分组件资产（windows-x64-utils.tgz / windows-x64-system-resources.tgz，bucket-* 滚动 tag）已在 2026-09-29 被整包取代，原因同 verilator.source.note。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
       "provides": [],
-      "check": { "exe": null },
-      "note": "是否所有组件都必需未实测——套件原本是整体分发的，分组件下载后各组件能否独立运行需要实装验证。这是分组件方案唯一的已知风险点。"
+      "check": {
+        "exe": null
+      },
+      "note": "套件各组件共用的运行时/资源（DLL、tcl 等）。原本按分组件单独下载，2026-09-29 起随整包一起来，**不再是独立安装步骤**。保留成独立条目是为了让清单能解释「.tools/oss 里那些 DLL 是哪来的」；它不提供任何能力（provides 为空），也探测不了（check.exe 为 null），装不装不由它决定。"
     },
     {
       "id": "oss-system-resources",
@@ -214,15 +287,21 @@
       "source": {
         "type": "github-release-asset",
         "repo": "YosysHQ/oss-cad-suite-build",
-        "tag": "bucket-windows-x64",
-        "asset": "windows-x64-system-resources.tgz",
-        "size_mb": 3.4,
-        "rolling": true
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
+        "rolling": false,
+        "note": "分组件资产（windows-x64-utils.tgz / windows-x64-system-resources.tgz，bucket-* 滚动 tag）已在 2026-09-29 被整包取代，原因同 verilator.source.note。"
       },
-      "install": { "method": "extract-tgz", "dest": ".tools/oss" },
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
       "provides": [],
-      "check": { "exe": null },
-      "note": "同上，必要性未实测。"
+      "check": {
+        "exe": null
+      },
+      "note": "套件各组件共用的运行时/资源（DLL、tcl 等）。原本按分组件单独下载，2026-09-29 起随整包一起来，**不再是独立安装步骤**。保留成独立条目是为了让清单能解释「.tools/oss 里那些 DLL 是哪来的」；它不提供任何能力（provides 为空），也探测不了（check.exe 为 null），装不装不由它决定。"
     },
     {
       "id": "slang",
@@ -232,17 +311,32 @@
       "verified": true,
       "source": {
         "type": "github-release-asset",
-        "repo": "MikePopoloski/slang",
-        "tag": "v11.0",
-        "asset": "slang-windows-x86_64.zip",
-        "size_mb": 5.1,
+        "repo": "YosysHQ/oss-cad-suite-build",
+        "tag": "2026-09-28",
+        "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+        "size_mb": 572.2,
         "rolling": false,
-        "note": "独立发布，有固定版本号（当前 v11.0），比套件的滚动 tag 更适合可复现安装。"
+        "note": "★ 2026-09-29 起改为**整包**。原先指向 MikePopoloski/slang 的独立 zip（5.1 MB），依据是「套件里只有 yosys-slang-plugin，没有独立的 slang.exe」——**这句话是错的，2026-09-29 实测推翻**：`.tools/oss/bin/slang.exe` 就在那儿 （9.7 MB，slang version 11.0.448+e222e7dc0），加上 .tools/oss/lib 到 PATH 后直接能 lint。既然整包反正要下（yosys/verilator/形式验证都要它），再单独下 5.1 MB 换不来任何东西，反而让「装了却没有」——bundled 的 slang 明明能用，`check_tools.py` 却报 lint.full 缺口。"
       },
-      "install": { "method": "extract-zip", "dest": ".tools/slang" },
-      "provides": ["lint.full"],
-      "check": { "exe": "slang", "version_arg": "--version" },
-      "note": "OSS CAD Suite 里只有 yosys-slang-plugin，没有独立的 slang.exe，所以要单独下这个。slang 是完整的 SV 前端（parse + elaborate），SVA 语法解析是它的强项，但它不仿真——能把断言静态展开，不能跑断言。"
+      "install": {
+        "method": "extract-tgz",
+        "dest": ".tools/oss"
+      },
+      "provides": [],
+      "check": {
+        "exe": "slang",
+        "version_arg": "--version",
+        "lib_dirs": [
+          "lib"
+        ],
+        "functional": {
+          "args": [
+            "tools/probe/vlearn_probe.v"
+          ],
+          "note": "真跑一次 elaborate。只查 --version 证明不了它能用：slang 同样要 .tools/oss/lib 里的运行时 DLL，没有 lib_dirs 会STATUS_DLL_NOT_FOUND 且**一个字节输出都没有**。这条同时验了它能读文件。"
+        }
+      },
+      "note": "slang 是完整的 SV 前端（parse + elaborate），SVA 语法解析是它的强项，但它不仿真——能把断言静态展开，不能跑断言。2026-09-29 起随整包安装，不再单独下 MikePopoloski 的 zip。 ⚠ provides 是空的，而且是**故意**空的：本仓库的 lint 走 verilator（lint.full），slang 只是一套备选视角，还没有任何一讲挂在它上面——原先写的 provides=['lint.full'] 是句假话（那条 requires verilator）。真要用它做第二套 lint，先想清楚挂到哪一讲，再建能力、再写进 provides。"
     },
     {
       "id": "verible",
@@ -259,9 +353,17 @@
         "rolling": false,
         "note": "该 tag 是当前 latest。注意 Verible 并非每个 release 都带 win64 资产，升级版本时要先确认资产存在再改 tag。"
       },
-      "install": { "method": "extract-zip", "dest": ".tools/verible" },
-      "provides": ["lint.style"],
-      "check": { "exe": "verible-verilog-lint", "version_arg": "--version" },
+      "install": {
+        "method": "extract-zip",
+        "dest": ".tools/verible"
+      },
+      "provides": [
+        "lint.style"
+      ],
+      "check": {
+        "exe": "verible-verilog-lint",
+        "version_arg": "--version"
+      },
       "note": "L3-04 编码规范那讲能用上——把「规范」变成可自动检查的规则。低优先级。"
     },
     {
@@ -279,9 +381,15 @@
         "size_mb": null,
         "note": "PyPI 提供编译好的 win_amd64 轮子（cp310/311/312 都有），不需要本地编译。"
       },
-      "install": { "method": "venv-pip", "dest": ".tools/venv" },
+      "install": {
+        "method": "venv-pip",
+        "dest": ".tools/venv"
+      },
       "provides": [],
-      "check": { "exe": null, "module": "cocotb" },
+      "check": {
+        "exe": null,
+        "module": "cocotb"
+      },
       "note": "必需走 pip。为守住「不污染系统」的铁律，装进仓库私有的 .tools/venv/。属可选增强，现有 tb_common.vh + sim.py 判定链已覆盖 L1/L2 全部需求。"
     },
     {
@@ -297,9 +405,19 @@
         "assets_with_windows": 0,
         "note": "release 存在但 0 个二进制资产，只有源码包。重度依赖 POSIX API，Windows 上只能 MSYS2/WSL 编译。"
       },
-      "install": { "method": "wsl-apt", "dest": null },
-      "provides": ["sta.slack", "sdc.check", "power.est"],
-      "check": { "exe": "sta", "version_arg": "-version" },
+      "install": {
+        "method": "wsl-apt",
+        "dest": null
+      },
+      "provides": [
+        "sta.slack",
+        "sdc.check",
+        "power.est"
+      ],
+      "check": {
+        "exe": "sta",
+        "version_arg": "-version"
+      },
       "note": "Windows 原生无可用方案。装 WSL2 后可用。本仓库默认不装 WSL（改的是系统而非仓库，与「不影响环境」冲突）。"
     },
     {
@@ -315,19 +433,33 @@
         "assets_with_windows": 0,
         "note": "同 OpenSTA，release 无二进制资产。官方路线是 Linux / Docker / WSL2。"
       },
-      "install": { "method": "wsl-apt", "dest": null },
-      "provides": ["sta.slack", "dft.scan", "power.est", "cdc.check"],
-      "check": { "exe": "openroad", "version_arg": "-version" },
-      "note": "是 Windows 原生拿到 STA + DFT + 功耗的「唯一希望」——但前提是走 WSL2。本仓库默认不装。"
+      "install": {
+        "method": "wsl-apt",
+        "dest": null
+      },
+      "provides": [
+        "cdc.check",
+        "dft.scan"
+      ],
+      "check": {
+        "exe": "openroad",
+        "version_arg": "-version"
+      },
+      "note": "是 Windows 原生拿到 STA + DFT + 功耗的「唯一希望」——但前提是走 WSL2。本仓库默认不装。 ⚠ 注意别把这句话读成 provides：那三条能力（sta.slack / power.est / dft.scan）声明的 requires 是 **opensta**，不是 openroad ——清单的 requires 是合取，表达不了「两个都能顶上」。要换供应方得改那三条能力的 requires，不是往这里塞 provides。"
     }
   ],
-
   "capabilities": [
     {
       "id": "sim.run",
       "name": "编译 + 仿真 + 自动判定",
-      "levels": ["L1", "L2", "L3"],
-      "requires": ["iverilog"],
+      "levels": [
+        "L1",
+        "L2",
+        "L3"
+      ],
+      "requires": [
+        "iverilog"
+      ],
       "gap": "none",
       "impact": "blocks",
       "fallback": null,
@@ -337,8 +469,13 @@
     {
       "id": "sim.compare",
       "name": "两份实现并排跑、对照波形",
-      "levels": ["L1", "L2"],
-      "requires": ["iverilog"],
+      "levels": [
+        "L1",
+        "L2"
+      ],
+      "requires": [
+        "iverilog"
+      ],
       "gap": "none",
       "impact": "blocks",
       "fallback": null,
@@ -348,7 +485,10 @@
     {
       "id": "lint.latch",
       "name": "锁存器推断识别",
-      "levels": ["L1", "L2"],
+      "levels": [
+        "L1",
+        "L2"
+      ],
       "requires": [],
       "gap": "none",
       "impact": "blocks",
@@ -359,30 +499,39 @@
     {
       "id": "regress.params",
       "name": "多参数 × 多宏组合批量回归",
-      "levels": ["L2"],
+      "levels": [
+        "L2"
+      ],
       "requires": [],
-      "gap": "code",
+      "gap": "none",
       "impact": "shrinks",
       "fallback": "手工一组组跑",
-      "integration": "（待实现）",
-      "note": "缺的是代码不是软件。机制齐了（sim.py 支持 -D 和多 design），差一个遍历参数的批量脚本。L2-08、综合①、综合④ 用得上。"
+      "integration": "tools/regress.py",
+      "note": "零依赖，纯标准库。**它存在的唯一理由是防「扫了但没扫到区别」** —— 批量回归最典型的失败是「每一轮跑的都是同一个电路」，而它的表现是全绿、退出码 0、毫无异常，和「完全没工作」长得一模一样。两道防线：(1) 测试台自报 `EFFECTIVE_<名字>=<值>`，逐档核对（硬证据）；(2) 结果指纹对比——固定其余维、看这一维各取值之间有没有差异（启发式，无差异时需显式 `--allow-inert` 才放行）。两个计数分开报：`n_combos` 与「真的比出差异的对照组数」。L2-08、综合①、综合④ 用得上。"
     },
     {
       "id": "schematic.param",
       "name": "generate / 参数化设计的结构图",
-      "levels": ["L2"],
+      "levels": [
+        "L2"
+      ],
       "requires": [],
-      "gap": "code",
+      "gap": "none",
       "impact": "shrinks",
-      "fallback": "功能验证不受影响，只是少一张图",
+      "fallback": null,
       "integration": "tools/schematic.py",
-      "note": "schematic.py 遇到 generate 会主动标 unsupported——这是有意为之的设计原则（宁可说画不出来，也不画一个看着合理但是错的），不建议为了「支持更多」去改。真要结构对比，装了 yosys 后可以出综合后网表来做。"
+      "note": "模块体里的 generate 按参数默认值展开后再画，不需要任何额外软件。支持 for（含隐式 generate）、if/else（只画成立的那一支，另一支写进图的说明里）、嵌套循环、generate 里例化（合并成一条并标 ×N）、参数化位宽（[DW-1:0] 按默认值算）。**算不出来的绝不猜份数**：上界依赖编译宏、依赖未声明的名字、或 case generate，一律不画那块并说明理由，模块里手写的部分照画。例化处覆盖了参数的情况不追（图按默认值画）。"
     },
     {
       "id": "lint.full",
       "name": "完整 lint（位宽 / 组合环 / 多驱动 / unused）",
-      "levels": ["L2", "L3"],
-      "requires": ["verilator"],
+      "levels": [
+        "L2",
+        "L3"
+      ],
+      "requires": [
+        "verilator"
+      ],
       "gap": "software",
       "impact": "degrades",
       "fallback": "退回人工看波形，自研 _lint.py 只覆盖锁存器一类",
@@ -392,63 +541,87 @@
     {
       "id": "synth.encoding",
       "name": "状态编码对比（二进制 / 独热 / 格雷）",
-      "levels": ["L2"],
-      "requires": ["yosys"],
+      "levels": [
+        "L2"
+      ],
+      "requires": [
+        "yosys"
+      ],
       "gap": "software",
       "impact": "degrades",
       "fallback": "手工把三种编码各写一遍，用 iverilog -t sizer 量 FF / 门数——零下载就能拿到真实的对比数字",
-      "integration": "（待接入：iverilog -t sizer -o <文件>）",
-      "note": "L2-40、综合⑥（三种写法 × 三种编码 = 9 份）的核心看点。仿真里三种编码行为完全一样，只有看触发器数量和组合逻辑规模才能体现差异。已实测：同一段 4 状态机，二进制 2 FF / 17 gates / 6 MUX，独热 4 FF / 25 gates / 12 MUX——差异非常清楚，所以不装 yosys 也不至于「只剩一半」。yosys 多给的是**综合器自己挑编码**（写 enum/状态名，让它决定怎么编），这层 iverilog 做不到。"
+      "integration": "tools/synth.py --compare（零下载粗粒度，量面积）；tools/toggle.py（零下载，量翻转 —— 灰码那一半）；装了 yosys 后可让综合器自己挑编码",
+      "note": "L2-40、综合⑥（三种写法 × 三种编码 = 9 份）的核心看点。仿真里三种编码行为完全一样，只有硬件代价能体现差异，而**代价分两半，得两个工具各量一半**。\n**① 面积那一半 → tools/synth.py。** ★ 但 sizer 这个层级量不出灰码的好处，别把它讲成「三种编码都不同」：实测同一段 4 状态机，bin 2 FF / 21 门、gray 2 FF / 21 门 —— **一模一样**，onehot 才是 4 FF / 41 门。原因是 sizer **不做优化**，只是把同一份 case 结构翻译一遍：常量从 00/01/10/11 换成 00/01/11/10，结构没变、宽度没变。它对「状态寄存器变宽」敏感，对「同宽度下换编码」不敏感。`check_synth.py` 里把 bin==gray 钉成了断言，将来若有人「改进」出差异会直接报红。\n**② 翻转那一半 → tools/toggle.py（零下载）。** 灰码真正的价值是少翻转、省功耗，而这一半**连 yosys 也量不出来**——综合器不做活动性分析，它不知道哪些跳变是「热的」。只有仿真知道。实测同一台 4 位计数器、同一套激励：二进制 st 变化 34 次、翻 63 位（1.85 位/次），格雷 34 次、翻 34 位（**恰好 1.00 位/次**）。\n★ 所以这一项**保留 requires yosys 只是为了让综合器自己挑编码**（那是另一件事：让工具替你做状态分配，而不是量你已经做好的分配）。编码取舍的教学**两半现在都能动手**，但 `impact: degrades` 仍算准确：没有 yosys 时「让工具自己挑」这个环节做不了。\n★ 转述翻转数时别越界：它**完全由激励决定**，是这次仿真的属性不是设计的属性；toggle.py 会在可比性不成立时拒绝给比值，那个 null 不是「没差别」。"
     },
     {
       "id": "synth.area",
       "name": "面积 / 资源对比",
-      "levels": ["L2"],
-      "requires": ["yosys"],
+      "levels": [
+        "L2"
+      ],
+      "requires": [
+        "yosys"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "iverilog -t sizer 可给 FF / 门数估算；再退一步只能目测结构图",
-      "integration": "（待接入：iverilog -t sizer -o <文件>）",
-      "note": "L2-14、以及「面积优先 vs 时序优先」那类约束取舍题。两点注意：(1) -t sizer 数的是**未映射逻辑**，不是真实面积，只能横向比不能当门数报告用；(2) 它的结果**写文件不写 stdout**，必须带 -o，否则看起来像什么都没发生（安静地什么都没输出，很容易误判成不可用）。"
+      "integration": "tools/synth.py（零下载粗粒度）；yosys 给的是真正做优化+映射后的面积",
+      "note": "L2-14、以及「面积优先 vs 时序优先」那类约束取舍题。三点注意：(1) -t sizer 数的是**未映射逻辑**，不是真实面积，只能横向比不能当门数报告用；(2) 它的结果**写文件不写 stdout**，必须带 -o，否则看起来像什么都没发生（安静地什么都没输出，很容易误判成不可用）—— synth.py 已封好这个坑；(3) 既然不做优化，**同宽度换编码它一个数都不会变**（bin 和 gray 都是 2 FF / 21 门），拿它做编码取舍会得出「灰码没用」的错误结论，见 synth.encoding。\n★ 这个能力只管面积那一半。编码/状态机的**动态代价（翻多少位）综合器一概不问**，无论 sizer 还是 yosys 都不做活动性分析 —— 那一半在 tools/toggle.py，零下载。讲面积时必须说清「这只是代价的一半」，否则学习者会以为门数少就等于好。"
     },
     {
       "id": "synth.run",
       "name": "逻辑综合 + 门数报告",
-      "levels": ["L3"],
-      "requires": ["yosys"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "yosys"
+      ],
       "gap": "software",
       "impact": "degrades",
-      "fallback": "只能讲原理 + 读综合报告样例 + 人工估算门数",
-      "integration": "（待接入）",
-      "note": "L3-05 综合原理、L3-06 综合日志读解。装了 yosys 之后这两讲可以从「读样例」升级为「自己跑出来再读」。但要注意：yosys 是开源综合器，报告格式和 DC/Genus 不同，读解训练仍以真实商业报告样例为主。"
+      "fallback": "iverilog -t blif 能出工艺无关门级网表、-t sizer 能出 FF/门数估算（tools/synth.py，零下载）；再退一步才是讲原理 + 读报告样例 + 人工估算",
+      "integration": "tools/synth.py --netlist（零下载粗粒度）；装了 yosys 后可走完整综合与映射",
+      "note": "L3-05 综合原理、L3-06 综合日志读解。装了 yosys 之后这两讲可以从「读样例」升级为「自己跑出来再读」。但要注意两点：(1) yosys 是开源综合器，报告格式和 DC/Genus 不同，读解训练仍以真实商业报告样例为主；(2) 零下载的 iverilog 那条路**只做翻译不做优化**，给的是工艺无关网表，能讲清「组合逻辑怎么变成门」但讲不了映射、时序驱动优化、面积优化 —— 别拿它冒充综合器。"
     },
     {
       "id": "synth.netlist.iverilog",
       "name": "门级网表导出（iverilog 自带）",
-      "levels": ["L3"],
-      "requires": ["iverilog"],
-      "gap": "code",
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "iverilog"
+      ],
+      "gap": "none",
       "impact": "shrinks",
       "fallback": "手工跑 .tools/iverilog/bin/iverilog.exe -t blif 就能拿到网表，只是产物还没纳入统一流程",
-      "integration": "（待接入：iverilog -t blif）",
-      "note": "已实测可用，只是没接进脚本。零下载成本就能拿到工艺无关的门级网表，是「综合」这块最便宜的一块拼图。顺带一提 iverilog 另有个 -t sizer 后端能出 FF / 门数估算（见 synth.area），同样零下载。"
+      "integration": "tools/synth.py --netlist",
+      "note": "零下载成本就能拿到工艺无关的门级网表，是「综合」这块最便宜的一块拼图。★ **异步复位它吃不下**：`always @(posedge clk or negedge rst_n)` 会报 `sorry: blif: Asynchronous clear not implemented yet`，而 sizer 那条腿对同一个文件照常出数字 —— 两条腿能接受的 RTL 不一样，所以 `ok` 和 `n_sizer_ok` 是两个独立计数，拱进一类就会把「iverilog 后端的限制」误报成「你写法有问题」。这个失败有独立归类 `async_reset_unsupported`。其它三类：`not_synthesizable`（#延迟 / initial / 系统任务）、`iverilog_crash`（组合 always 分支不全→推断锁存器→synth2.cc 断言挂，退出码 0xC0000409）、`no_top`。"
     },
     {
       "id": "sim.gate_timing",
       "name": "门级时序仿真（specify / SDF 反标注）",
-      "levels": ["L3"],
-      "requires": ["iverilog"],
-      "gap": "code",
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "iverilog"
+      ],
+      "gap": "none",
       "impact": "shrinks",
       "fallback": "手工加 -gspecify 就能让 specify 延时生效，但没有自动违例判定（$setup/$hold 本就不支持）",
-      "integration": "（待接入：iverilog -gspecify）",
+      "integration": "tools/sim.py --specify",
       "note": "已实测：-gspecify 下 specify 块的路径延时真的生效；$sdf_annotate 存在但只认前两个参数，且 $setup / $hold 时序检查明确不支持（编译时警告 Timing checks are not supported）。所以能反标注延时、不能自动报违例，违例得自己看波形判断。"
     },
     {
       "id": "sta.slack",
       "name": "静态时序分析 / slack 计算",
-      "levels": ["L3"],
-      "requires": ["opensta"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "opensta"
+      ],
       "gap": "software",
       "impact": "talk_only",
       "fallback": "手算 slack（L3-08 大纲本来就这么写的）",
@@ -458,30 +631,42 @@
     {
       "id": "sta.estimate",
       "name": "时序驱动的映射估算（非 STA）",
-      "levels": ["L3"],
-      "requires": ["yosys"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "yosys"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "只能定性讲「关键路径大概在哪」",
-      "integration": "（待接入）",
+      "integration": "（仓库有活干，但**卡口是 yosys 不是代码**：装了才值得写）",
       "note": "yosys 配 abc -liberty 能按延时约束做映射优化，给出的是**估算**而非签核级 STA——算不出 slack、枚举不了路径。这是 sta.slack 不可用时的部分替代，不要把它当成 STA 讲。"
     },
     {
       "id": "lint.style",
       "name": "编码规范自动检查",
-      "levels": ["L3"],
-      "requires": ["verible"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "verible"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "用规范清单人工审查（L3-04 大纲本来就这么写的）",
-      "integration": "（待接入）",
+      "integration": "（仓库有活干，但**卡口是 verible 不是代码**：装了才值得写）",
       "note": "L3-04 RTL 编码规范、L3-33 代码评审能用上——把「规范」从文档变成可自动检查的规则。低优先级，verilator 的 lint.full 覆盖不了风格类规则。"
     },
     {
       "id": "sdc.check",
       "name": "SDC 时序约束解析与检查",
-      "levels": ["L3"],
-      "requires": ["opensta"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "opensta"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "手写 SDC 后人工审阅（L3-07 大纲本来就这么写的）",
@@ -491,19 +676,28 @@
     {
       "id": "cdc.formal",
       "name": "CDC 结构性质的形式验证",
-      "levels": ["L3"],
-      "requires": ["formal", "z3"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "formal",
+        "z3"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "人工审查 + 自写结构性检查脚本",
-      "integration": "（待接入）",
+      "integration": "（仓库有活干，但**卡口是 sby/z3 不是代码**：装了才值得写）",
       "note": "这是 CDC 唯一「能真跑」的替代路径：用 sby 证明同步器性质（两级同步器不传播亚稳态、格雷码指针每次只变一位）。要手写属性，但写出来就是真的验证过。比「讲原理」强，值得补进 L3-12。"
     },
     {
       "id": "cdc.check",
       "name": "CDC 自动静态检查",
-      "levels": ["L3"],
-      "requires": ["openroad"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "openroad"
+      ],
       "gap": "software",
       "impact": "degrades",
       "fallback": "讲风险分类 + 行为验证 + cdc.formal 的形式验证",
@@ -513,74 +707,105 @@
     {
       "id": "formal.prop",
       "name": "形式属性验证",
-      "levels": ["L3"],
-      "requires": ["formal", "z3"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "formal",
+        "z3"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "只能讲概念",
-      "integration": "（待接入）",
+      "integration": "（仓库有活干，但**卡口是 sby/z3 不是代码**：装了才值得写）",
       "note": "sby(13.5MB) + z3(18.4MB) = 约 32 MB 就能从「只能讲」变成能动手。套件自带求解器是它相对自行搭建的最大优势。"
     },
     {
       "id": "formal.lec",
       "name": "形式等价性检查（LEC）",
-      "levels": ["L3"],
-      "requires": ["eqy", "formal", "z3"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "eqy",
+        "formal",
+        "z3"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "只能讲概念",
-      "integration": "（待接入）",
+      "integration": "（仓库有活干，但**卡口是 eqy/formal/z3 不是代码**：装了才值得写）",
       "note": "L3-15。eqy 只有 1.4 MB，配合已下的 formal + z3 就能做「RTL vs 综合后网表」的等价性检查，正好补上综合那块的闭环。"
     },
     {
       "id": "cov.code",
       "name": "代码覆盖率（行 / 翻转）",
-      "levels": ["L3"],
-      "requires": ["verilator", "mingw"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "verilator",
+        "mingw"
+      ],
       "gap": "software",
       "impact": "degrades",
-      "fallback": "只能讲概念 + 手工统计",
-      "integration": "（待接入）",
+      "fallback": "只能讲概念 + 手工统计（功能覆盖率的合并见 cov.func，那条已经能跑了）",
+      "integration": "（仓库有活干，但**卡口是 verilator+mingw 不是代码**：装了才值得写）",
       "note": "iverilog 没有任何覆盖率功能（-h 里无相关 flag，已实测）。verilator 提供 line / toggle / user 三类覆盖率和 verilator_coverage 报告工具。注意没有 IEEE 语义的 covergroup/coverpoint 功能覆盖率。⚠ 覆盖率属于 verilator 的「编译出仿真模型」那条路，需要 C++ 编译器 + make。所以这里 requires 两项**不是凑数**：只装 verilator 的话本项仍然缺着，会误报「装了就好」。"
     },
     {
       "id": "toolchain.cc",
       "name": "C++ 编译链（供 verilator 编译仿真模型）",
-      "levels": ["L3"],
-      "requires": ["mingw"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "mingw"
+      ],
       "gap": "software",
       "impact": "shrinks",
       "fallback": "覆盖率、并发断言、verilator --binary 直接仿真都用不了，只能退回 iverilog 那条路",
-      "integration": "（待接入）",
+      "integration": "（不接入 —— 本项就是「给别的能力用」的工具链本身，repository 不调编译器）",
       "note": "单列出来是为了让「缺什么」说得清：make 和编译器是两件事，且**瓶颈在编译器**。实测本机的 g++ 是 Qt 自带 mingw 7.3（2017），而 verilator 是按 GCC 15.2.1 配置的，连撞 -fcf-protection=none 不认 / python3 缺失 / 缺 -lpsapi / WinMain 未定义四个问题，逐个绕过也不牢靠。所以这一项要的是**现代 mingw-w64**，不是补一个 make。"
     },
     {
       "id": "cov.func",
       "name": "功能覆盖率统计",
-      "levels": ["L3"],
+      "levels": [
+        "L3"
+      ],
       "requires": [],
-      "gap": "code",
+      "gap": "none",
       "impact": "shrinks",
       "fallback": "手工统计",
-      "integration": "（待实现）",
-      "note": "缺的是代码。可以基于 sim.py 的判定计数做——VLEARN_CHECK 已经在按用例名记通过/失败了，把它聚合成覆盖率报告是纯脚本工作。"
+      "integration": "tools/cov.py",
+      "note": "零依赖，纯标准库。合并多份测试台的覆盖点，**取并集、不取平均**。平均会**两个方向都错**：(10/10, 0/1) 平均 50% 而真值 10/11=91%（低报）；(1/1, 0/10) 平均 50% 而真值 1/11=9%（高报，而且高报在「看着挺勤快」那一侧，更危险）。★ 两个计数必须分开报：`n_runs` 是跑了几份，`n_runs_with_cover` 是其中几份带覆盖数据 —— 没声明覆盖点的那份**既不加分子也不加分母**（不是「覆盖了 0 个点」，那会拉低合并比值），它和「编译失败没跑出结果」（进 `failed_runs`）是两回事。没声明覆盖点时 `ratio` 报 `null` 而不是 `0.0`。另有 `undeclared_hits` 专抓**命中名拼错**——一个拼错的覆盖点不报错不警告，症状只是覆盖率静默变低。（代码覆盖率见 cov.code，那条仍缺。）"
     },
     {
       "id": "sva.assert",
       "name": "SystemVerilog 断言（SVA）",
-      "levels": ["L3"],
-      "requires": ["verilator"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "verilator",
+        "mingw"
+      ],
       "gap": "software",
       "impact": "degrades",
       "fallback": "用独立 always 块手写时序性质检查，走 VLEARN_CHECK 上报——已实测能拿到带用例名和时间点的逐条 pass/fail（但学不到 SVA 语法本身）",
       "integration": "（已按替代方案改写 L3-18 大纲）",
-      "note": "已实测：iverilog 对 assert property 直接报语法错误，装了 verilator 也只覆盖子集且卡在 C++ 编译链路。但可用的部分比预期多：立即断言 assert(expr) else $error(...) 在 -g2012 下能编译（sim.py 本来就传这个 flag），只是 $error 不改变判定；$fatal 能停仿真但会在 TEST_DONE 前中断，被 sim.py 判成 inconclusive 而非 fail——所以两者都不适合当判定手段。正解是独立 always 块 + VLEARN_CHECK。L3-18 已按此改写，不再是「整讲做不了」。"
+      "note": "已实测：iverilog 对 assert property 直接报语法错误，装了 verilator 也只覆盖子集且卡在 C++ 编译链路。但可用的部分比预期多：立即断言 assert(expr) else $error(...) 在 -g2012 下能编译（sim.py 本来就传这个 flag），只是 $error 不改变判定；$fatal 能停仿真但会在 TEST_DONE 前中断，被 sim.py 判成 inconclusive 而非 fail——所以两者都不适合当判定手段。正解是独立 always 块 + VLEARN_CHECK。L3-18 已按此改写，不再是「整讲做不了」。⚠ requires 里两项是**都要**：verilator 覆盖 SVA 子集，但它跑断言走的是 --binary，需要 C++ 编译器。只写 verilator 会让这一项被算成「可用」——那正是本仓库最不想要的谎报（文件在 ≠ 能用）。"
     },
     {
       "id": "dft.scan",
       "name": "DFT / 扫描链插入 / ATPG",
-      "levels": ["L3"],
-      "requires": ["openroad"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "openroad"
+      ],
       "gap": "software",
       "impact": "talk_only",
       "fallback": "讲原理 + 写扫描友好约束（L3-14 / L3-30 大纲本来就这么写的）",
@@ -590,8 +815,12 @@
     {
       "id": "power.est",
       "name": "功耗分析",
-      "levels": ["L3"],
-      "requires": ["opensta"],
+      "levels": [
+        "L3"
+      ],
+      "requires": [
+        "opensta"
+      ],
       "gap": "software",
       "impact": "talk_only",
       "fallback": "讲原理 + 手算（L3-13 大纲本来就这么写的）",

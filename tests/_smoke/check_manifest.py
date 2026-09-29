@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -168,6 +169,44 @@ with tempfile.TemporaryDirectory() as td:
         "software.provides 指向不存在的 capability 没有被抓到（本次开发中就真的踩到这个）",
     )
 
+    # -------------------------------------------------- 负例 5b：provides 与 requires 对不上
+    #
+    # 病根（2026-09-29 在真清单上抓到的）：slang.provides 说它提供 lint.full，
+    # 而 lint.full.requires 是 ['verilator']。两个方向**各自**看着都成立，
+    # 合起来是一句假话。真清单上这一类一共有 5 条（yosys 认领 sby 的两条、
+    # openroad 认领 opensta 的三条，详见各条 note）。
+    #
+    # 这里三个子例分别锁住：单向多出来、反向漏写、以及合法情形不许误报。
+    _prov_case = lambda prov, reqs: M.load(
+        _write(
+            tmp,
+            _minimal(
+                software=[
+                    {"id": "a", "name": "A", "windows": "native", "provides": prov},
+                    {"id": "b", "name": "B", "windows": "native", "provides": []},
+                ],
+                capabilities=[
+                    {"id": "cap.x", "name": "X", "levels": ["L1"], "requires": reqs,
+                     "impact": "blocks", "gap": "software"},
+                ],
+            ),
+        )
+    )
+
+    # ① a 认领了 cap.x，但 cap.x 依赖的是 b → 必须报
+    probs = M.validate(_prov_case(["cap.x"], ["b"]))
+    check(any("两边对不上" in p for p in probs),
+          f"provides 认领了不属于它的能力，没被抓到——使用者会以为这条能力有两个来源：{probs}")
+
+    # ② cap.x 依赖 b，但 b.provides 是空的 → 同样必须报（漏写方向）
+    probs = M.validate(_prov_case([], ["b"]))
+    check(any("provides 里没写这条" in p for p in probs),
+          f"requires 依赖的软件没写进 provides，没被抓到：{probs}")
+
+    # ③ 正向对照：两边写齐了就不许报（否则上面两条可能是「validate 见谁都报」）
+    probs = M.validate(_prov_case(["cap.x"], ["a"]))
+    check(probs == [], f"两边对得上的清单被误报了：{probs}")
+
 # ---------------------------------------------------------------- 负例 6：探测失败不能被当成成功
 fake = M.Software(
     id="definitely-not-installed",
@@ -197,6 +236,9 @@ with tempfile.TemporaryDirectory() as td:
                         "name": "幽灵工具",
                         "windows": "native",
                         "check": {"exe": "zznonexistenttool_9f3a"},
+                        # provides 必须写全：validate 现在双向查，
+                        # 漏写会被当成清单错误（这正是负例 5b 锁的那件事）
+                        "provides": ["cap.needs_ghost"],
                     }
                 ],
                 capabilities=[
@@ -495,6 +537,95 @@ _sw_nolib = M.Software(
 )
 check("PATH" not in M.tool_env(_sw_nolib), "没配 lib_dirs 却凭空改了 PATH")
 
+# ---------------------------------------------------------------- 负例 8e：repo_private 不许回退到系统 PATH
+#
+# 复用系统上早装过的工具通常是好事，但**结果取决于版本的工具不能复用**：
+# 系统 PATH 上那个 mingw 7.3 会让 verilator 编出一串查不出原因的错，
+# 而报告只会写「已安装但不可用」——使用者照着去查 PATH 也找不到原因。
+# 所以清单里能标 repo_private，探测就只认 .tools/。
+#
+# 这里拿**一定存在**的解释器当样本（它就在系统 PATH 上），
+# 检验"标了私有就找不到、不标就能找到"。少了后半句，前半句可能是
+# 因为 exe 名字压根不存在而假通过的。
+_py_priv = M.Software(
+    id="must-be-private",
+    name="只认私有安装的工具",
+    summary="",
+    windows="native",
+    raw={
+        "check": {"exe": _py.stem},
+        "install": {"dest": ".tools/must-be-private"},
+        "repo_private": True,
+    },
+    check_exe=_py.stem,
+    version_arg="--version",
+    repo_private=True,
+)
+pr_priv = M.probe(_py_priv, extra_path=[_py.parent])
+check(
+    pr_priv.found is False,
+    "标了 repo_private 的工具仍然从系统 PATH 上找到了——私有化策略形同虚设",
+)
+check(
+    "私有" in pr_priv.detail or "repo_private" in pr_priv.detail,
+    f"没找到但不说清是因为「只认私有安装」，使用者会去翻 PATH：{pr_priv.detail}",
+)
+check(M.locate(_py_priv) is None, "locate() 绕过了 repo_private，仍会返回系统 PATH 上的那份")
+
+# 正向对照：把 repo_private 去掉，同一个工具、同一个 extra_path 就该找得到。
+# 没有这条，上面"没找到"可能只是 exe 名字压根解析错了而假通过。
+_py_pub = M.Software(
+    id="may-be-public",
+    name="可复用系统安装的工具",
+    summary="",
+    windows="native",
+    raw={"check": {"exe": _py.stem}},
+    check_exe=_py.stem,
+    version_arg="--version",
+)
+pr_pub = M.probe(_py_pub, extra_path=[_py.parent])
+check(
+    pr_pub.found is True,
+    "去掉 repo_private 后本该找到——那上面那条断言就是假通过",
+)
+
+# 再验一次**真的系统 PATH 分支**（不是 extra_path 模拟的那条）：复用系统安装
+# 必须在 detail 里标出来，否则读报告的人分不清这工具是仓库装的还是系统上蹭的。
+if shutil.which(_py.stem):
+    pr_dir = M.probe(_py_pub)
+    check(pr_dir.found is True, "解释器就在 PATH 上却没能复用")
+    check(
+        "系统 PATH" in pr_dir.detail,
+        f"从 PATH 复用却没标注出来，报告里会看不出工具是从哪来的：{pr_dir.detail}",
+    )
+else:
+    print(f"  ⊘ 系统 PATH 上没有 {_py.stem}，跳过「PATH 复用要标注来源」这一条")
+
+# repo_private 的意义是"只认 .tools/ 里的那份"，所以必须写 install.dest ——
+# 没写就等于在任何机器上都判未安装，且装也装不进来，只会永远缺着。
+with tempfile.TemporaryDirectory() as td:
+    _mm_priv = M.load(
+        _write(
+            Path(td),
+            _minimal(
+                software=[
+                    {
+                        "id": "priv-no-dest",
+                        "name": "标了私有却没写安装位置",
+                        "windows": "native",
+                        "repo_private": True,
+                        "check": {"exe": "x"},
+                    }
+                ]
+            ),
+        )
+    )
+    _probs = M.validate(_mm_priv)
+    check(
+        any("repo_private" in p for p in _probs),
+        "repo_private 没配 install.dest 没有被 validate 抓到——它会永远缺着且装不进来",
+    )
+
 # ---------------------------------------------------------------- 负例 9：解压路径穿越
 #
 # 下载来的归档必须当**不可信输入**处理。成员名里带 ../ 的归档，
@@ -640,6 +771,317 @@ with tempfile.TemporaryDirectory() as td:
         "剥过头了——bin/ 被当成包裹层吃掉了",
     )
 
+# ---------------------------------------------------------------- 负例 9c：下载被截断
+#
+# 2026-09-29 实测栽的坑，而且是**静默**的那种：572 MB 的 oss-cad-suite 下到
+# 540 MB 被掐断，.part 照样改名成正式文件、退出码 0，少 32 MB 谁也不知道。
+# 病根在 http.client 里 —— 带长度参数的 read(amt) 遇到连接提前关闭时**返回空串**，
+# 不抛 IncompleteRead（源码那段注释自己写着 "Ideally, we would raise
+# IncompleteRead ... but it might break compatibility"）。于是"读完了"和
+# "读断了"在调用方眼里一模一样。原有的 gzip 魔数检查拦不住：魔数在前两字节。
+#
+# 这里起一个真会短发的本地 HTTP 服务来复现，而不是单元测试某个私有函数 ——
+# 要验的恰恰是"读空串时到底有没有比对长度"这条端到端的判断。
+import contextlib  # noqa: E402
+import http.server  # noqa: E402
+import threading  # noqa: E402
+
+_FULL = b"Y" * 100_000
+
+
+class _TruncServer(http.server.BaseHTTPRequestHandler):
+    """按路径决定怎么发：写全 / 声明了长度却少发 / 无视 Range 返回 200。"""
+
+    def log_message(self, *a):  # 别把访问日志糊到测试输出里
+        pass
+
+    def do_GET(self):  # noqa: N802
+        if self.path == "/trunc":
+            self.send_response(200)
+            self.send_header("Content-Length", "1000000")  # 声明 1 MB
+            self.end_headers()
+            self.wfile.write(b"X" * 3000)  # 只给 3 KB 就断
+            self.close_connection = True
+        elif self.path == "/fine":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(_FULL)))
+            self.end_headers()
+            self.wfile.write(_FULL)
+        elif self.path == "/ignore-range":
+            # 客户端带 Range 来续传，服务端**无视它**，按 200 发整份。
+            # 这时 Content-Length 是整份长度，不能再加 resume_from，
+            # 否则读满了也会被判成截断。
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(_FULL)))
+            self.end_headers()
+            self.wfile.write(_FULL)
+        else:
+            self.send_error(404)
+
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _TruncServer)
+    port = srv.server_address[1]
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    try:
+        base = f"http://127.0.0.1:{port}"
+        quiet = contextlib.redirect_stdout(io.StringIO())
+
+        # ① 短发必须抛错，且 .part 要留着（留着才能续传）
+        p1 = tmp / "a.tgz.part"
+        with quiet:
+            try:
+                ST._download_once(f"{base}/trunc", p1)
+                check(False, "下载被截断却当成成功了——长度根本没比对")
+            except ST.TruncatedDownload as exc:
+                check("3000" in str(exc) and "1000000" in str(exc),
+                      f"抛了截断但没说清差多少：{exc}")
+        check(p1.is_file() and p1.stat().st_size == 3000, ".part 没保住，续传就断了")
+        check(issubclass(ST.TruncatedDownload, OSError),
+              "截断异常不是 OSError，download() 的重试分支接不住，会直接崩")
+
+        # ② 正向对照：发全了就不能报截断，否则上面那条是"什么都判坏"的假通过
+        p2 = tmp / "b.tgz.part"
+        with quiet:
+            ST._download_once(f"{base}/fine", p2)
+        check(p2.stat().st_size == len(_FULL), "正常下载的文件大小不对")
+
+        # ③ 回归护栏：服务端无视 Range 返回 200 时，不能拿 resume_from 去加长度
+        p3 = tmp / "c.tgz.part"
+        p3.write_bytes(b"Z" * 500)  # 假装已经续了 500 字节
+        with quiet:
+            try:
+                ST._download_once(f"{base}/ignore-range", p3)
+            except ST.TruncatedDownload as exc:
+                check(False, f"服务端无视 Range 反而被判成截断：{exc}")
+        check(p3.stat().st_size == len(_FULL),
+              f"服务端无视 Range 时应该从头写，实际 {p3.stat().st_size} 字节")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+    # ④ 缓存命中也得复核体积：> 1 MB 只说明"不像错误页面"，不说明是完整的
+    big = tmp / "cached.tgz"
+    big.write_bytes(b"\x1f\x8b" + b"\x00" * (2 * 1024 * 1024))  # 2 MB，像个包
+    check(ST._size_shortfall(big, {"size_mb": 572.2}) is not None,
+          "缓存里 2 MB 的包被当成完整的 572 MB —— 截断文件会被跳过不重下")
+    check(ST._size_shortfall(big, {"size_mb": 2.0}) is None,
+          "体积对得上却报缺斤少两")
+    check(ST._size_shortfall(big, {}) is None,
+          "清单没写 size_mb 时不该瞎猜")
+
+# ---------------------------------------------------------------- 负例 9d：同一归档不许装两遍
+#
+# 2026-09-29 把 verilator / oss-utils / oss-system-resources 也改指整包之后，
+# 清单里有**四项指向同一个 572 MB 归档**（都往 .tools/oss 里放东西）。
+# do_install 照着 id 逐个装，就会把同一份 16953 条目的 tgz 解压四遍、
+# 往磁盘写四遍 2 GB —— 不报错，只是白干，最难被发现的那种浪费。
+#
+# 这里把 install_one 换成记账用的桩，直接验"按 (repo,tag,asset) 判重"这条。
+# 用桩而不是真装：要验的是**调度**，真装一次要解压 2 GB，那是另一回事。
+_shared_src = {
+    "type": "github-release-asset",
+    "repo": "YosysHQ/oss-cad-suite-build",
+    "tag": "2026-09-28",
+    "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+    "size_mb": 572.2,
+}
+
+
+def _stub_sw(sid: str, asset_src: dict) -> dict:
+    return {
+        "id": sid, "name": sid, "summary": "", "windows": "native",
+        "source": asset_src, "install": {"method": "extract-tgz", "dest": ".tools/oss"},
+        "provides": [], "check": {"exe": None},
+    }
+
+
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    man = M.load(_write(tmp, _minimal(software=[
+        _stub_sw("a_suite", _shared_src),
+        _stub_sw("b_suite", dict(_shared_src)),                 # 同一份归档
+        _stub_sw("c_other", dict(_shared_src, asset="other.tgz", size_mb=7.5)),  # 换归档
+    ])))
+
+    calls: list[str] = []
+    real_install_one = ST.install_one
+    # 签名必须跟 install_one(sw, verbose, lock, force) 对齐——
+    # 少一个参数就会 TypeError，而这是 stub 的错、不是被测代码的错
+    ST.install_one = lambda sw, verbose, lock, force: (calls.append(sw.id), (True, "ok"))[1]
+    try:
+        with contextlib.redirect_stdout(io.StringIO()) as buf:
+            rc = ST.do_install(man, ["a_suite", "b_suite", "c_other"], verbose=False, lock=False)
+        out = buf.getvalue()
+    finally:
+        ST.install_one = real_install_one
+
+    check(calls == ["a_suite", "c_other"],
+          f"同一归档被装了不止一次：实际调用了 {calls}")
+    check("是同一个归档" in out and "b_suite" in out,
+          "跳过时没说明白是跟谁重复，使用者会以为它自己装好了")
+    check(rc == ST.EXIT_OK, f"跳过导致退出码变红：{rc}")
+    check(out.count("ok") == 2, f"跳过的那项被算成失败了：{out!r}")
+
+    # 反向对照：换了 asset 就必须真装，否则上面那条可能是"什么都跳"的假通过
+    check("c_other" in calls, "不同归档也被跳过了——判重键太宽")
+
+    # --list 的"下载量"列：多条共用一个归档时不能每行都印 572.2 MB ——
+    # 那样读起来像要下七次。这里同时验两件事：共用行标 ↳，脚注**只**点共用的那组。
+    # （脚注第一版把所有归档的拥有者都列了进去，把独占自己归档的 c_other 也算了进去。）
+    with contextlib.redirect_stdout(io.StringIO()) as buf:
+        ST.do_list(man)
+    listing = buf.getvalue()
+    check("↳a_suite" in listing, f"共用同一个归档的那行没标 ↳：\n{listing}")
+    check("other.tgz" not in listing.split("注：")[-1],
+          "脚注把独占自己归档的条目也算成共用了")
+    check("a_suite, b_suite 共用同一个归档" in listing,
+          f"脚注没说清是哪几个共用：\n{listing.splitlines()[-3:]}")
+    check(listing.count("572.2 MB") == 1,
+          f"共用归档的体积应该只在第一行印一次，实际印了 "
+          f"{listing.count('572.2 MB')} 次：\n{listing}")
+    check("7.5 MB" in listing,
+          "独占自己归档的那行体积没印出来")
+
+# ---------------------------------------------------------------- 负例 9e：锁真的有人查吗
+#
+# 病根：`--lock` 的文档一直写着「记下 sha256，之后靠它校验」，但在 2026-09-29
+# 之前**全仓库没有任何代码读 tools.lock.json** —— 锁只写不读，是一张没人查的收据。
+# 而那一周刚发生过一次静默截断（572 MB 下到 540 MB 照样报成功），
+# 锁存在的全部意义就是防这个。
+#
+# 这里直接验 _lock_problem 的四种情形，而不是走 CLI：CLI 上「已安装」短路
+# 先于锁校验触发，已经装好的机器上那条路根本走不到。要验的是**判据本身**。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    M_EMPTY = M.load(_write(tmp, _minimal()))
+    real_lock_path = ST.LOCK_PATH
+    ST.LOCK_PATH = tmp / "tools.lock.json"
+    try:
+        SRC = {"repo": "R", "tag": "T", "asset": "a.tgz"}
+        GOOD = "a" * 64
+        BAD = "b" * 64
+
+        # ① 没有记录 → 不拦（第一次装，天经地义）
+        check(ST._lock_problem("x", SRC, GOOD) is None, "没有锁记录却拦了")
+
+        ST._write_lock("x", SRC, GOOD)
+        # ② 对得上 → 放行
+        check(ST._lock_problem("x", SRC, GOOD) is None, "sha256 一致却报不一致")
+        # ③ ★ 对不上 → 必须拦，且要把两个哈希都摆出来（只说"不一致"没法排查）
+        bad_msg = ST._lock_problem("x", SRC, BAD)
+        check(bad_msg is not None, "sha256 不一致却没有拦——锁又变成没人查的收据了")
+        check(GOOD in bad_msg and BAD in bad_msg,
+              f"报不一致但没把两个哈希都列出来：{bad_msg}")
+        # ④ 资产换了（分组件 → 整包）→ 没有可比性，不算不一致，但也不算通过
+        check(ST._lock_problem("x", {"repo": "R", "tag": "T", "asset": "b.tgz"}, BAD) is None,
+              "资产换了却报 sha256 不一致——这是拿「换了份文件」冒充「文件被改了」")
+        # ⑤ 锁里那条没有 sha256 → 是坏记录，不能当成通过
+        ST._write_lock("y", SRC, GOOD)
+        d = json.loads(ST.LOCK_PATH.read_text(encoding="utf-8"))
+        del d["y"]["sha256"]
+        ST.LOCK_PATH.write_text(json.dumps(d), encoding="utf-8")
+        check(ST._lock_problem("y", SRC, BAD) is not None,
+              "锁里没写 sha256 却被当成校验通过")
+
+        # ⑥ 锁文件本身坏了：必须出警告，且**不能**静默降级成"全部通过"
+        ST.LOCK_PATH.write_text("{ 这不是 JSON", encoding="utf-8")
+        errbuf = io.StringIO()
+        with contextlib.redirect_stderr(errbuf):
+            got = ST._read_lock()
+        check(got == {}, "坏锁文件没被降级成空")
+        check("警告" in errbuf.getvalue(),
+              "坏锁文件被静默降级了——校验会全绿而实际一个字节都没查")
+
+        # ⑦ --verify-lock 必须把「对不上」「无法校验」分开报，且对不上要红
+        ST.LOCK_PATH.write_text(json.dumps({
+            "ok_one": {"repo": "R", "tag": "T", "asset": "there.tgz", "sha256": "z" * 64},
+            "bad_one": {"repo": "R", "tag": "T", "asset": "there.tgz", "sha256": "0" * 64},
+            "gone_one": {"repo": "R", "tag": "T", "asset": "not-cached.tgz", "sha256": "q" * 64},
+        }), encoding="utf-8")
+        (tmp / "there.tgz").write_bytes(b"hello")
+        real_cache = ST.CACHE_DIR
+        ST.CACHE_DIR = tmp
+        try:
+            with contextlib.redirect_stdout(io.StringIO()) as obuf:
+                rc = ST.do_verify_lock(M_EMPTY)
+            rep = obuf.getvalue()
+            real_digest = ST.sha256_of(tmp / "there.tgz")
+            # ok_one 的 sha256 是假的，所以 ok=0、bad=2、unknown=1
+            check(rc == ST.EXIT_FAIL, f"有条目不一致时 --verify-lock 没红（rc={rc}）")
+            check("通过 0" in rep and "不一致 2" in rep and "无法校验 1" in rep,
+                  f"三类结果没分开报：\n{rep}")
+            check("无法校验" in rep and "不是通过" in rep,
+                  "「缓存里没有归档」没有明确排除在通过之外")
+            check(real_digest in rep or real_digest[:16] in rep,
+                  "没把实算的 hash 打出来，排查时无从对照")
+        finally:
+            ST.CACHE_DIR = real_cache
+
+        # ⑧ 一条都校验不成时，必须说出来 —— 别让"全绿"实际是"全没查"
+        ST.LOCK_PATH.write_text(json.dumps({
+            "gone": {"repo": "R", "tag": "T", "asset": "nope.tgz", "sha256": "q" * 64},
+        }), encoding="utf-8")
+        with contextlib.redirect_stdout(io.StringIO()) as obuf:
+            rc = ST.do_verify_lock(M_EMPTY)
+        rep = obuf.getvalue()
+        check(rc == ST.EXIT_OK, "只有「无法校验」时不该判失败")
+        check("别把这次结果读成" in rep,
+              f"一条都没校验成，却没说清这不等于锁干净：\n{rep}")
+    finally:
+        ST.LOCK_PATH = real_lock_path
+
+# ---------------------------------------------------------------- 负例 9f：「已安装」短路
+#
+# 原先每次 install_one 都完整解压一遍：2026-09-29 跑 --install yosys --lock
+# 就白解压了 16953 个条目、白写 2 GB。setup_toolchain.py 早有这个短路。
+#
+# 但短路有个前提：**证据得撑得住**。有 check.exe 的走功能自检；
+# 没有 check.exe 的（公共库）只能看目录在不在 —— 那是 found 不是 usable，
+# 印出来的话就不能是「自检通过」。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    (tmp / "d").mkdir()
+    (tmp / "d" / "something.dll").write_bytes(b"x")
+
+    real_probe = ST.probe
+    try:
+        # ① 有 check.exe 且自检通过 → 短路，且说明里点明「自检通过」
+        ST.probe = lambda sw: type("P", (), {"found": True, "usable": True, "version": "1.2"})()
+
+        # 用绝对路径绕开 repo_root()，装到临时目录
+        sw = M.Software(id="p", name="有自检的工具", summary="", windows="native",
+                        raw={"install": {"dest": str(tmp / "d")}, "check": {"exe": "x"}},
+                        check_exe="x")
+        skip, why = ST._already_installed(sw)
+        check(skip is True, "自检通过却没短路")
+        check("自检通过" in why, f"短路说明没说是靠自检：{why}")
+
+        # ② ★ 有 check.exe 但自检没过 → 绝不能短路（这正是 found≠usable 的现场）
+        ST.probe = lambda sw: type("P", (), {"found": True, "usable": False, "version": None})()
+        skip, why = ST._already_installed(sw)
+        check(skip is False, "文件在但自检没过，却当成已安装短路了")
+
+        # ③ 没有 check.exe、目录非空 → 短路，但**不许说成「自检通过」**
+        sw2 = M.Software(id="q", name="公共库", summary="", windows="native",
+                         raw={"install": {"dest": str(tmp / "d")}, "check": {"exe": None}},
+                         check_exe=None)
+        skip, why = ST._already_installed(sw2)
+        check(skip is True, "公共库目录在却没短路——会白解压 2 GB")
+        check("自检通过" not in why, f"没自检却说成自检通过：{why}")
+        check("证明不了" in why, f"没说清证据有多弱：{why}")
+
+        # ④ 没有 check.exe、目录不存在 → 不能短路
+        sw3 = M.Software(id="r", name="公共库2", summary="", windows="native",
+                         raw={"install": {"dest": str(tmp / "nope")}, "check": {"exe": None}},
+                         check_exe=None)
+        skip, _ = ST._already_installed(sw3)
+        check(skip is False, "安装目录都不存在却短路了")
+    finally:
+        ST.probe = real_probe
+
 # ---------------------------------------------------------------- 负例 10：安装护栏
 # WSL-only 的软件必须被拒绝，且**不能发起下载**。
 # 如果这里漏了，装 opensta 会白下几百 MB 再失败。
@@ -667,6 +1109,7 @@ print("  ✓ gap=code 与 gap=software 区分正确，不给出无用的安装�
 print("  ✓ WSL-only 依赖与可安装依赖分开报告，--for-level 不会去下装不上的东西")
 print("  ✓ 「文件在」与「真能跑」分开判：自检失败的工具不满足能力（带正向对照）")
 print("  ✓ lib_dirs 并入 PATH 而非覆盖（覆盖会让子进程找不到系统命令，且不报错）")
+print("  ✓ repo_private 只认仓库私有安装，系统 PATH 上的同名工具不算（带正向对照）")
 print("  ✓ 归档路径穿越（tar/zip）被拦住，正常归档仍能解压")
 print("  ✓ 包裹层剥离：多层剥离到位、碰到 bin/ 停手、多目录归档不动")
 print("  ✓ WSL-only 的软件被拒绝，不会白下载")

@@ -20,8 +20,18 @@
 
 具体的取舍：
 
-* **`generate` / 参数化例化**：展开需要知道参数的实际取值，靠文本推不出来。
-  整个模块的内部图标记为不支持（层次图仍然给，因为例化关系是确定的）。
+* **`generate`**：能算出圈数就展开，算不出来就**只丢那一块**。判断依据是
+  参数的**默认值**（`#(parameter N = 4)` → N=4），所以 `for (i=0; i<N; i=i+1)`
+  能算出跑 4 圈，而 `parameter N = `NUM_CH`（编译宏）或 `N` 压根没声明，
+  就一律拒绝 —— 猜一个份数会画出一张看着合理、读者却无从察觉的错图。
+  拒绝是**逐区域**的：那块 generate 不画（图上写明理由），模块里手写的
+  部分照画。展开后各次迭代在信号级（位下标已抹掉）往往完全一样，会合并成
+  一条并标 `×N`，否则画 4 个同样的框会让人以为是 4 段不同的逻辑。
+  同理支持 `if`/`else` generate（只画成立的那一支，另一支写进说明）和
+  参数化位宽 `[DW-1:0]`。`case` generate **明确不支持** —— 分支靠 `值 : 语句`
+  切分，而冒号在位宽和三目运算符里都出现，切错了会静默丢分支。
+* **参数化例化**（`leaf #(.W(8)) u(...)`）：图按**子模块自己的默认值**画，
+  实例框上标出 `#(W=8)` 提示这里有覆盖，但不追进去重算。层次图不受影响。
 * **时序边界**：`always @(posedge clk)` 里 `q <= d`，右边读的是**旧值**。
   如果按普通依赖画成 d → q 的实线，画出来的就是一个组合环，
   而这恰恰是学习者最容易搞错的地方。所以时序块的输出用虚线，
@@ -69,6 +79,23 @@ _BLOCK_STARTERS = ("always", "initial", "generate", "function", "task")
 _SCOPE_ENDERS = {"endfunction", "endtask", "endgenerate", "endmodule", "endpackage"}
 
 
+def width_label_of(width: int | None, width_text: str = "") -> str:
+    """信号名后面跟的位宽标注。
+
+    三种情况，后两种**必须分清**：
+      * 算出来了（`[7:0]` / `[WIDTH-1:0]` 而 WIDTH=8）→ `[8]`
+      * 没算出来但原文有范围（参数默认值里有函数调用之类）→ 照抄 `[WIDTH-1:0]`
+      * 根本没有范围 → 空
+    第二种照抄原文，是因为"位宽是多少我不确定"和"它就是个 1 位信号"
+    完全是两回事；只写空字符串会让读者以为是后者。
+    """
+    if width is not None and width > 1:
+        return f"[{width}]"
+    if width is None and width_text:
+        return width_text
+    return ""
+
+
 @dataclass
 class Port:
     name: str
@@ -81,7 +108,7 @@ class Port:
 
     @property
     def width_label(self) -> str:
-        return f"[{self.width}]" if self.width and self.width > 1 else ""
+        return width_label_of(self.width, self.width_text)
 
 
 @dataclass
@@ -106,6 +133,11 @@ class Block:
     sensitivity: str = ""
     note: str = ""
     unsupported: str | None = None
+    # 来自哪个 generate 块（`generate g`）。空 = 手写的顶层语句。
+    origin: str = ""
+    # 同源等价语句合并后，这一条代表几份（generate 展开出来的）。
+    # 1 = 没合并。**只有 origin 非空时才会 >1**，见 _merge_repeats。
+    repeat: int = 1
 
     @property
     def sequential(self) -> bool:
@@ -130,6 +162,8 @@ class Instance:
     conns: list[tuple[str, str]] = field(default_factory=list)
     params: dict[str, str] = field(default_factory=dict)
     line: int = 0
+    origin: str = ""
+    repeat: int = 1
 
 
 @dataclass
@@ -138,12 +172,27 @@ class Module:
     line: int = 0
     file: str = ""
     params: list[str] = field(default_factory=list)
+    # 参数的**默认值原文**，和 params 一一对应。默认值就是一段常量表达式，
+    # 多数情况下光看源码就能算出来 —— 算出来的那张表见 param_env。
+    param_pairs: list[tuple[str, str]] = field(default_factory=list)
+    # 参数名 → 按默认值算出的整数。generate 边界和位宽都靠它。
+    param_env: dict[str, int] = field(default_factory=dict)
+    # 默认值算不出来的参数名。依赖它们的图件一律停用（不猜）。
+    param_failed: list[str] = field(default_factory=list)
     ports: list[Port] = field(default_factory=list)
     decls: list[Decl] = field(default_factory=list)
     blocks: list[Block] = field(default_factory=list)
     instances: list[Instance] = field(default_factory=list)
     unknown_names: list[str] = field(default_factory=list)
     unsupported: list[str] = field(default_factory=list)
+    # generate 展开成功的**说明**（不是错误）：展开了几份、哪一支没画。
+    # 和 unsupported 分开放，是因为它们的性质不同 —— 一个是"没画"，
+    # 一个是"画了，但你要知道画的只是其中一种参数取值"。
+    gen_notes: list[str] = field(default_factory=list)
+    # 当前正在展开的 generate 出处，由 _classify_statement 设置、
+    # _parse_assign / _parse_always / _parse_instance 读取。
+    # 用一个字段而不是给三个函数加参数，是为了不惊动它们的其它调用方。
+    _cur_origin: str = field(default="", repr=False)
     # 例化输出接到了本模块的哪些信号上。
     # 只有先知道**子模块**端口的方向才能判断，所以要等全部模块解析完再回填
     # （见 _resolve_instance_outputs），不能在解析单个模块时算出来。
@@ -183,6 +232,14 @@ class Module:
             if d.name == name:
                 return d.width
         return None
+
+    def width_label_of(self, name: str) -> str:
+        """给图上打的位宽标注。算不出具体位数时**照抄源码里的范围**。"""
+        for coll in (self.ports, self.decls):
+            for it in coll:
+                if it.name == name:
+                    return width_label_of(it.width, it.width_text)
+        return ""
 
 
 @dataclass
@@ -305,6 +362,317 @@ def _line_of(text: str, pos: int) -> int:
     return text.count("\n", 0, pos) + 1
 
 
+# ---------------------------------------------------------------- 常量求值
+#
+# 为什么需要它：`generate for (i = 0; i < N; i = i + 1)` 到底展开几份、
+# `[WIDTH-1:0]` 到底几位，都得先知道参数的值。而参数的默认值就是一段常量
+# 表达式，多数情况下**光看源码就能算出来**（`N = 4`、`W = DW*2`、
+# `DEPTH = 1 << ADDR_W`），所以值得算。
+#
+# 但它**不是通用表达式求值器**，只有一个很窄的意图：给结构图提供
+# "这个参数等于几"这一个事实。因此：
+#
+#   * 算不出来一律返回 None，由调用方记一条"这块画不了"，**绝不猜一个值**。
+#     一个猜出来的 N 会展开出错误的份数，画出一张看着合理的错图 ——
+#     这比"这张图画不了"坏得多。
+#   * 位宽一律按 64 位无符号近似：本工具只用结果去数循环、算位宽，
+#     不做位精确的硬件语义模拟。`~` 按 64 位取反，其余运算符直接用 Python 整数。
+#   * `x`/`z` 参与的常量一律算不出来（值本身就不确定）。
+
+_EVAL_MASK = (1 << 64) - 1
+
+_TOK_RE = re.compile(
+    r"""
+      (?P<ws>\s+)
+    | (?P<num>\d+\s*'\s*[sS]?[bBoOdDhH]\s*[0-9a-fA-FxXzZ?_]+
+             |\d+\s*'\s*[sS]?[01xXzZ]
+             |'\s*[sS]?[bBoOdDhH]\s*[0-9a-fA-FxXzZ?_]+
+             |\d[\d_]*)
+    | (?P<sys>\$[A-Za-z_]\w*)
+    | (?P<id>[A-Za-z_]\w*)
+    | (?P<op>\*\*|<<<|>>>|<=|>=|==|!=|&&|\|\||<<|>>|[-+*/%&|^~!<>()?:])
+    """,
+    re.X,
+)
+
+
+class _EvalError(Exception):
+    """算不出来。**只在 _eval_const 内部传播**，出口一律变成 None。"""
+
+
+def _parse_verilog_int(tok: str) -> int:
+    """`8'd10` / `4'hF` / `'b1010` / `1_000` → 整数。含 x/z 的算不出来。"""
+    t = tok.replace("_", "").replace(" ", "")
+    m = re.fullmatch(r"(\d*)'([sS]?)([bBoOdDhH])([0-9a-fA-FxXzZ?]+)", t)
+    if m:
+        digits = m.group(4).lower()
+        if any(c in digits for c in "xz?"):
+            raise _EvalError(f"{tok} 里有 x/z，常量不确定")
+        base = {"b": 2, "o": 8, "d": 10, "h": 16}[m.group(3).lower()]
+        return int(digits, base)
+    m = re.fullmatch(r"(\d*)'([sS]?)([01xXzZ])", t)
+    if m:
+        if m.group(3).lower() in "xz":
+            raise _EvalError(f"{tok} 里有 x/z")
+        return int(m.group(3))
+    try:
+        return int(t, 10)
+    except ValueError as e:
+        raise _EvalError(f"认不出的数 {tok!r}") from e
+
+
+class _ExprParser:
+    """递归下降。优先级从低到高照抄 Verilog 的运算符表。"""
+
+    def __init__(self, tokens: list[tuple[str, str]], env: dict[str, int]):
+        self.toks = tokens
+        self.i = 0
+        self.env = env
+
+    # ---- 基础 ----
+    def _peek_op(self, *ops: str) -> str | None:
+        if self.i < len(self.toks):
+            kind, val = self.toks[self.i]
+            if kind == "op" and val in ops:
+                return val
+        return None
+
+    def _eat_op(self, op: str) -> bool:
+        if self._peek_op(op):
+            self.i += 1
+            return True
+        return False
+
+    # ---- 各层 ----
+    def expr(self) -> int:
+        return self.ternary()
+
+    def ternary(self) -> int:
+        c = self.logic_or()
+        if self._eat_op("?"):
+            a = self.ternary()
+            if not self._eat_op(":"):
+                raise _EvalError("三目运算符缺 :")
+            b = self.ternary()
+            return a if c else b
+        return c
+
+    def _bin(self, sub, *ops: str) -> int:
+        left = sub()
+        while True:
+            op = self._peek_op(*ops)
+            if op is None:
+                return left
+            self.i += 1
+            right = sub()
+            left = _apply_binop(op, left, right)
+
+    def logic_or(self) -> int:
+        return self._bin(self.logic_and, "||")
+
+    def logic_and(self) -> int:
+        return self._bin(self.bit_or, "&&")
+
+    def bit_or(self) -> int:
+        return self._bin(self.bit_xor, "|")
+
+    def bit_xor(self) -> int:
+        return self._bin(self.bit_and, "^")
+
+    def bit_and(self) -> int:
+        return self._bin(self.equality, "&")
+
+    def equality(self) -> int:
+        return self._bin(self.relational, "==", "!=")
+
+    def relational(self) -> int:
+        return self._bin(self.shift, "<", "<=", ">", ">=")
+
+    def shift(self) -> int:
+        return self._bin(self.additive, "<<", ">>", "<<<", ">>>")
+
+    def additive(self) -> int:
+        return self._bin(self.multiplicative, "+", "-")
+
+    def multiplicative(self) -> int:
+        return self._bin(self.power, "*", "/", "%")
+
+    def power(self) -> int:
+        # 右结合：2**3**2 = 2**(3**2)
+        base = self.unary()
+        if self._eat_op("**"):
+            return _apply_binop("**", base, self.power())
+        return base
+
+    def unary(self) -> int:
+        op = self._peek_op("-", "+", "~", "!")
+        if op:
+            self.i += 1
+            v = self.unary()
+            if op == "-":
+                return -v
+            if op == "+":
+                return v
+            if op == "~":
+                return (~v) & _EVAL_MASK
+            return 0 if v else 1
+        return self.primary()
+
+    def primary(self) -> int:
+        if self.i >= len(self.toks):
+            raise _EvalError("表达式不完整")
+        kind, val = self.toks[self.i]
+        self.i += 1
+        if kind == "num":
+            return _parse_verilog_int(val)
+        if kind == "sys":
+            return self._syscall(val)
+        if kind == "id":
+            if val in self.env:
+                return self.env[val]
+            raise _EvalError(f"算不出 {val} 的值（不是本模块里能确定的常量）")
+        if kind == "op" and val == "(":
+            v = self.expr()
+            if not self._eat_op(")"):
+                raise _EvalError("括号不配对")
+            return v
+        raise _EvalError(f"表达式里有认不出的东西 {val!r}")
+
+    def _syscall(self, name: str) -> int:
+        if name != "$clog2":
+            raise _EvalError(f"不支持的系统函数 {name}")
+        if not self._eat_op("("):
+            raise _EvalError("$clog2 后面缺括号")
+        v = self.expr()
+        if not self._eat_op(")"):
+            raise _EvalError("$clog2 的括号不配对")
+        # 忠实于 Verilog：$clog2(1) = 0、$clog2(0) = 0，**不**兜到 1。
+        # 常有 `AW = $clog2(DEPTH)` 在 DEPTH=1 时得 0，那就是真实行为。
+        if v <= 1:
+            return 0
+        return (v - 1).bit_length()
+
+
+def _apply_binop(op: str, a: int, b: int) -> int:
+    if op in ("<<", "<<<"):
+        return a << b if 0 <= b < 4096 else _raise(f"移位位数 {b} 离谱")
+    if op in (">>", ">>>"):
+        return (a >> b) if 0 <= b < 4096 else _raise(f"移位位数 {b} 离谱")
+    if op == "+":
+        return a + b
+    if op == "-":
+        return a - b
+    if op == "*":
+        return a * b
+    if op == "/":
+        if b == 0:
+            raise _EvalError("除数是 0")
+        # Verilog 的整除向零截断，Python 的 // 是向下取整 —— 负数上不一样
+        q = abs(a) // abs(b)
+        return q if (a < 0) == (b < 0) else -q
+    if op == "%":
+        if b == 0:
+            raise _EvalError("取模的除数是 0")
+        r = abs(a) % abs(b)
+        return r if a >= 0 else -r
+    if op == "**":
+        if b < 0 or b > 64:
+            raise _EvalError(f"指数 {b} 不支持")
+        return a**b
+    if op == "&":
+        return a & b
+    if op == "|":
+        return a | b
+    if op == "^":
+        return a ^ b
+    if op == "&&":
+        return 1 if (a and b) else 0
+    if op == "||":
+        return 1 if (a or b) else 0
+    if op == "==":
+        return 1 if a == b else 0
+    if op == "!=":
+        return 1 if a != b else 0
+    if op == "<":
+        return 1 if a < b else 0
+    if op == "<=":
+        return 1 if a <= b else 0
+    if op == ">":
+        return 1 if a > b else 0
+    if op == ">=":
+        return 1 if a >= b else 0
+    return _raise(f"不支持的运算符 {op}")
+
+
+def _raise(msg: str):
+    raise _EvalError(msg)
+
+
+def _tokenize_expr(expr: str) -> list[tuple[str, str]]:
+    out: list[tuple[str, str]] = []
+    pos = 0
+    n = len(expr)
+    while pos < n:
+        m = _TOK_RE.match(expr, pos)
+        if not m:
+            raise _EvalError(f"表达式里有认不出的字符 {expr[pos]!r}")
+        pos = m.end()
+        if m.lastgroup == "ws":
+            continue
+        out.append((m.lastgroup, m.group()))
+    return out
+
+
+def eval_const(expr: str, env: dict[str, int]) -> int | None:
+    """把一段常量表达式算成整数；算不出来返回 None（**不抛异常**）。"""
+    try:
+        p = _ExprParser(_tokenize_expr(expr), env)
+        v = p.expr()
+        if p.i != len(p.toks):
+            raise _EvalError("表达式后面还有多余的东西")
+        return v
+    except (_EvalError, RecursionError):
+        return None
+
+
+def const_failure_reason(expr: str, env: dict[str, int]) -> str:
+    """算不出来时，给一句能指名道姓的理由（图上的提示要用它）。"""
+    try:
+        p = _ExprParser(_tokenize_expr(expr), env)
+        p.expr()
+        return "表达式无法求值"
+    except _EvalError as e:
+        return str(e)
+    except RecursionError:
+        return "表达式嵌套太深"
+
+
+def build_param_env(pairs: list[tuple[str, str]]) -> tuple[dict[str, int], list[str]]:
+    """按默认值算出一张"参数 → 整数"的表。
+
+    多轮迭代是为了处理参数之间的依赖：`parameter DW = 8; parameter W = DW*2;`
+    一轮扫下来 W 算不出（DW 还没进表），第二轮才行。达到不动点就停 ——
+    剩下的就是**真的算不出来**的（默认值里有函数调用、有外部宏之类），
+    它们的名字要如实报出去，因为凡是依赖它们的图都得停用。
+    """
+    env: dict[str, int] = {}
+    pending = list(pairs)
+    for _ in range(len(pending) + 2):
+        if not pending:
+            break
+        rest: list[tuple[str, str]] = []
+        for name, raw in pending:
+            v = eval_const(raw, env)
+            if v is None:
+                rest.append((name, raw))
+            else:
+                env[name] = v
+        if len(rest) == len(pending):
+            break
+        pending = rest
+    return env, [name for name, _ in pending]
+
+
 # ---------------------------------------------------------------- 解析
 
 
@@ -373,7 +741,9 @@ def _match_paren(text: str, open_pos: int) -> int:
     return -1
 
 
-def _split_top_commas(s: str) -> list[str]:
+def _split_top_commas(s: str, sep: str = ",") -> list[str]:
+    """按顶层分隔符切开。括号里的分隔符不算 —— 名字沿用历史，
+    `sep` 参数是后来加的：generate 的 `for` 头要按 `;` 切三段。"""
     out: list[str] = []
     depth = 0
     cur = 0
@@ -382,23 +752,639 @@ def _split_top_commas(s: str) -> list[str]:
             depth += 1
         elif c in ")]}":
             depth -= 1
-        elif c == "," and depth == 0:
+        elif c == sep and depth == 0:
             out.append(s[cur:i])
             cur = i + 1
     out.append(s[cur:])
     return [x.strip() for x in out if x.strip()]
 
 
-def _width_from(range_text: str) -> tuple[int | None, str]:
-    """把 `[7:0]` 解析成位宽 8。`[WIDTH-1:0]` 这种含参数的返回 None。"""
+def _width_from(range_text: str, env: dict[str, int] | None = None) -> tuple[int | None, str]:
+    """把 `[7:0]` 解析成位宽 8。`[WIDTH-1:0]` 用参数默认值算，算不出填 None。
+
+    注意返回值第二项（原文）**不管算不算得出来都保留**：算不出来时它是
+    唯一能给读者看的信息，图上就照原样显示 `[WIDTH-1:0]`，比什么都不写强，
+    也比瞎写一个位数强。
+    """
     m = _RANGE_RE.search(range_text)
     if not m:
         return None, range_text.strip()
     hi, lo = m.group(1).strip(), m.group(2).strip()
-    if hi.isdigit() and lo.isdigit():
-        w = abs(int(hi) - int(lo)) + 1
-        return w, range_text.strip()
+    h = eval_const(hi, env or {})
+    l = eval_const(lo, env or {})
+    if h is not None and l is not None:
+        return abs(h - l) + 1, range_text.strip()
     return None, range_text.strip()
+
+
+# ------------------------------------------------------------ generate 展开
+#
+# 目标是：`for (i = 0; i < 4; i = i + 1)` 这种**边界能从源码算出来**的
+# generate，把它当成 4 份普通语句展开，图上照常画。
+#
+# ★ 底线和别处一样：**算不出来就明说不画，绝不猜份数。**
+#   猜一个 N 会展开出错误的份数，画出一张看着合理的错图 ——
+#   那比"这张图画不了"坏得多，因为读者无从察觉。
+#
+# 只展开三种形态，其余一律拒绝（拒绝时整段从正常解析里抹掉，
+# 免得 `for` / `case` 被当成例化名解析出一堆垃圾节点）：
+#
+#     generate ... endgenerate            （显式）
+#     for (...) ...                        （隐式 generate，Verilog-2001 起合法）
+#     if (...) ... [else ...]              （同上）
+#
+# `case` generate 不展开 —— 它的 item 分割要认冒号，而冒号在位宽和 `?:`
+# 里都出现，切错了会静默丢分支。宁可明说不支持。
+
+_GENERATE_BOUND_LIMIT = 4096   # 循环上界的安全阀：算错了也不至于挂死
+
+# 展开时把循环变量替换成 `(值)`，所以各圈之间的差别**只**体现在这些
+# 括号里的数字上。合并等价语句前把 `(数字)` 抹掉，就能让各圈"看起来
+# 一样"（`d[(0)]` / `d[(1)]` → `d[]`），从而认出它们是同一个 generate
+# 的拷贝。不能改成"取第一个标识符"那种更粗的归一化：`.x(a+b)` 和
+# `.x(a+c)` 会被归一成同一个键，把两处**不同**的连接合并成一条。
+_GENVAL_ARTIFACT_RE = re.compile(r"\((\d+)\)")
+
+
+def _norm_conn(expr: str) -> str:
+    return _GENVAL_ARTIFACT_RE.sub("", expr)
+
+
+def _strip_comments(text: str) -> str:
+    """把注释和字符串**内容**换成空格，长度和换行都保持不变。
+
+    扫描 generate 边界必须先做这一步：`// generate 一下` 这样的注释
+    会让 begin/end 计数错位。换行保留，所以偏移量、行号都还能直接用。
+
+    只在本模块的扫描里用，**不动 iter_statements 的行为** —— 那是既有
+    解析路径，改它会牵连所有已经验过的用例。
+    """
+    out = list(text)
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            while i < n and text[i] != "\n":
+                out[i] = " "
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            out[i] = out[i + 1] = " "
+            i += 2
+            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
+                if text[i] != "\n":
+                    out[i] = " "
+                i += 1
+            if i < n:
+                out[i] = " "
+                if i + 1 < n:
+                    out[i + 1] = " "
+                i += 2
+            continue
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                if text[i] == "\\":
+                    out[i] = " "
+                    i += 1
+                if i < n:
+                    if text[i] != "\n":
+                        out[i] = " "
+                    i += 1
+            if i < n:
+                out[i] = " "
+                i += 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _stmt_end(text: str, i: int) -> int:
+    """从 i 往后找这一条语句的结束偏移（**不含**结尾的 `;`）。
+
+    规则和 iter_statements 一致：同时看括号深度和 begin/end 深度，
+    块状语句结尾没有分号。用来切 generate 的循环体 / 分支体。
+    """
+    n = len(text)
+    paren = 0
+    blocks = 0
+    k = i
+    started = False
+    while k < n:
+        ch = text[k]
+        if ch in "([{":
+            paren += 1
+            k += 1
+            continue
+        if ch in ")]}":
+            paren = max(0, paren - 1)
+            k += 1
+            continue
+        if ch == ";":
+            if paren == 0 and blocks == 0:
+                return k
+            k += 1
+            continue
+        if ch.isalpha() or ch == "_":
+            m = _IDENT_RE.match(text, k)
+            if m is None:
+                k += 1
+                continue
+            w = m.group(1)
+            if w == "begin":
+                blocks += 1
+                started = True
+            elif w == "end":
+                blocks = max(0, blocks - 1)
+                if blocks == 0 and started:
+                    j = m.end()
+                    t = j
+                    while t < n and text[t] in " \t\r\n":
+                        t += 1
+                    if t >= n or text[t] != ";":
+                        return t
+            elif w in _BLOCK_STARTERS or w in _SCOPE_ENDERS:
+                started = True
+            k = m.end()
+            continue
+        k += 1
+    return n
+
+
+def _gen_stmt_end(text: str, i: int, head: str) -> int:
+    """generate 里一条语句的结束偏移。`if` 要把 `else` 那一支一起圈进来。
+
+    不圈的话会**切出半条语句**：`if (c) begin ... end else begin ... end`
+    里 `_stmt_end` 在第一个 `end` 后就返回（因为 `end` 后面不是 `;`），
+    于是 else 分支留在原地被当成一条顶层语句 —— 它的头是 `else`，
+    走到 _parse_instance 就是一个凭空冒出来的假节点。
+    """
+    end = _stmt_end(text, i)
+    if head != "if":
+        return end
+    n = len(text)
+    while True:
+        j = end
+        while j < n and text[j] in " \t\r\n":
+            j += 1
+        if not text.startswith("else", j):
+            return end
+        if j + 4 < n and (text[j + 4].isalnum() or text[j + 4] == "_"):
+            return end          # `elsewhere` 之类的标识符，不是 else
+        k = j + 4
+        while k < n and text[k] in " \t\r\n":
+            k += 1
+        if k >= n:
+            return end
+        end = _stmt_end(text, k)
+
+
+def _find_kw(text: str, i: int, kw: str) -> int:
+    """从 i 开始找**同层**的下一个关键字 kw 的偏移；找不到返回 -1。
+
+    同层 = 括号深度 0、begin/end 深度 0。用来配平
+    generate/endgenerate、case/endcase、function/endfunction。
+    """
+    n = len(text)
+    paren = 0
+    blocks = 0
+    k = i
+    while k < n:
+        ch = text[k]
+        if ch in "([{":
+            paren += 1
+            k += 1
+            continue
+        if ch in ")]}":
+            paren = max(0, paren - 1)
+            k += 1
+            continue
+        if ch.isalpha() or ch == "_":
+            m = _IDENT_RE.match(text, k)
+            if m is None:
+                k += 1
+                continue
+            w = m.group(1)
+            if w == "begin":
+                blocks += 1
+            elif w == "end":
+                blocks = max(0, blocks - 1)
+            elif paren == 0 and blocks == 0 and w == kw:
+                return k
+            k = m.end()
+            continue
+        k += 1
+    return -1
+
+
+def _paren_group(text: str, i: int) -> tuple[str, int]:
+    """从 i（应为 `(`）取出括号里的一段，返回 (内容, 右括号后一位)。"""
+    if i >= len(text) or text[i] != "(":
+        return "", i
+    close = _match_paren(text, i)
+    if close < 0:
+        return "", i
+    return text[i + 1:close], close + 1
+
+
+def _split_gen_header(header: str) -> list[str] | None:
+    """把 `i = 0; i < 4; i = i + 1` 按顶层分号切成三段。"""
+    parts = _split_top_commas(header, sep=";")
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts if len(parts) == 3 else None
+
+
+@dataclass
+class _GenItem:
+    """展开出来的一条语句。"""
+    text: str
+    line: int
+    origin: str = ""       # 「generate g」这样的出处；空表示不是 generate 来的
+
+
+@dataclass
+class _Region:
+    kind: str              # "for" | "if" | "case"
+    start: int             # 在模块体里的起始偏移（含关键字）
+    end: int               # 结束偏移（不含）
+    line: int              # start 对应的文件行号
+
+
+def _scan_regions(text: str) -> list[_Region]:
+    """找出模块体里所有顶层的 generate 区域。
+
+    显式 `generate ... endgenerate` 整段算一个区域；隐式的
+    `for` / `if` / `case` 按语句边界算一个区域。
+    `function` / `task` / `always` / `initial` 里的东西**不算** ——
+    它们里面的 if 是普通语句，不是 generate。
+    """
+    out: list[_Region] = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch.isalpha() or ch == "_":
+            m = _IDENT_RE.match(text, i)
+            if m is None:
+                i += 1
+                continue
+            w = m.group(1)
+            if w == "generate":
+                close = _find_kw(text, m.end(), "endgenerate")
+                end = len(text)
+                if close >= 0:
+                    em = _IDENT_RE.match(text, close)
+                    end = em.end() if em else close + len("endgenerate")
+                out.append(_Region("generate", i, end, _line_of(text, i)))
+                i = end
+                continue
+            if w in ("for", "if", "case"):
+                end = _gen_stmt_end(text, i, w)
+                out.append(_Region(w, i, end, _line_of(text, i)))
+                i = end
+                continue
+            if w in ("function", "task"):
+                # function / task 整段作为一个"只抹掉、不展开"的区域。
+                # 抹掉是必须的：iter_statements 对 `function ... begin ... end
+                # ... endfunction` 的 begin/end 计数会切出奇怪的碎片，碎片
+                # 的头可能是 `begin` 或 `endfunction`，落到 _parse_instance
+                # 就凭空多出一个假节点（实测报出过一个叫 `begin if` 的实例）。
+                kw = "endfunction" if w == "function" else "endtask"
+                close = _find_kw_nested_ok(text, m.end(), kw)
+                end = close if close > 0 else _stmt_end(text, i)
+                out.append(_Region(w, i, end, _line_of(text, i)))
+                i = end
+                continue
+            if w in ("always", "initial"):
+                # always 里的 if 不是 generate；整条语句跳过
+                i = _stmt_end(text, i)
+                continue
+            i = m.end()
+            continue
+        i += 1
+    return out
+
+
+def _find_kw_nested_ok(text: str, i: int, kw: str) -> int:
+    """找 kw（endfunction / endtask），允许中间有 begin/end。找不到返回 -1。"""
+    n = len(text)
+    k = i
+    while k < n:
+        if text[k].isalpha() or text[k] == "_":
+            m = _IDENT_RE.match(text, k)
+            if m is None:
+                k += 1
+                continue
+            if m.group(1) == kw:
+                return m.end()
+            k = m.end()
+            continue
+        k += 1
+    return -1
+
+
+def _blank(text: str, start: int, end: int) -> str:
+    """把 [start, end) 抹成空格（**换行保留**），偏移量和行号因此不变。"""
+    seg = text[start:end]
+    return text[:start] + re.sub(r"[^\n]", " ", seg) + text[end:]
+
+
+def _subst_genvar(expr: str, var: str, val: int) -> str:
+    return re.sub(r"\b" + re.escape(var) + r"\b", f"({val})", expr)
+
+
+def _expand_for(region_text: str, content_line: int, env: dict[str, int],
+                origin: str) -> tuple[list[_GenItem], list[str], list[str]]:
+    """展开一个 for generate。返回 (语句, 拒绝理由, 说明)。"""
+    items: list[_GenItem] = []
+    # `for (…)`
+    k = region_text.find("(")
+    if k < 0:
+        return [], ["generate 的 for 缺括号，这块不展开"], []
+    header, after = _paren_group(region_text, k)
+    parts = _split_gen_header(header)
+    if parts is None:
+        return [], ["generate 的 for 头不是 `初值; 条件; 步进` 三段，这块不展开"], []
+    init_s, cond_s, step_s = parts
+
+    mi = re.match(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+)$", init_s, re.S)
+    ms = re.match(r"^\s*([A-Za-z_]\w*)\s*=\s*(.+)$", step_s, re.S)
+    if not mi or not ms:
+        return [], ["generate 的 for 初值/步进不是 `变量 = 表达式`，这块不展开"], []
+    var = mi.group(1)
+    if ms.group(1) != var:
+        return [], [f"generate 的 for 步进改的是 {ms.group(1)} 而不是循环变量 {var}，这块不展开"], []
+
+    body = region_text[after:]
+    # 循环体的行号要从**原文**算：后面替换循环变量会改文本长度，
+    # 但每次都从 region_text 重新数，就不会累积漂移。
+    body_line = content_line + _line_of(region_text, after) - 1
+    val = eval_const(mi.group(2), env)
+    if val is None:
+        return [], [f"generate 的 for 初值 {mi.group(2).strip()} 算不出来，这块不展开"], []
+
+    label = _gen_label(body)
+    tag = f"generate {label}" if label else "generate for"
+    # 去 begin-end 外壳：名字要先取出来（_gen_label 看的就是外壳），再去壳。
+    # 行号一律从 region_text 的起点**绝对**算，不做累加 —— 累加写法
+    # （先算 after 的行、再加上去壳的偏移）会和 _line_of 的 1 基差
+    # 悄悄差一行，而且差多少取决于 begin 是不是和 for 在同一行。
+    body, inner_off = _unwrap_begin(body)
+    body_line = content_line + _line_of(region_text, after + inner_off) - 1
+    values: list[int] = []
+    while len(values) < _GENERATE_BOUND_LIMIT:
+        c = eval_const(cond_s, {**env, var: val})
+        if c is None:
+            return [], [
+                f"{tag} 的循环条件 {cond_s.strip()} 算不出来"
+                f"（循环变量 {var} 已经知道是 {val}，所以缺的是别的参数），这块不展开"
+            ], []
+        if not c:
+            break
+        values.append(val)
+        nv = eval_const(ms.group(2), {**env, var: val})
+        if nv is None:
+            return [], [f"{tag} 的步进 {ms.group(2).strip()} 算不出来，这块不展开"], []
+        val = nv
+    if len(values) >= _GENERATE_BOUND_LIMIT:
+        return [], [f"{tag} 的循环次数超过 {_GENERATE_BOUND_LIMIT}，块不展开（八成是条件写错了）"], []
+    if not values:
+        # 0 次循环是合法的（`for (i = 0; i < N; i = i + 1)` 且 N = 0），
+        # 什么都不画，也**不算错误**。但也不能悄悄咽掉 —— 读者会以为
+        # 这个 generate 被漏解析了，说明一下。
+        return [], [], [f"{tag} 展开出来是 0 份（循环条件一开始就不成立），没有画出任何东西"]
+
+    infos: list[str] = []
+    if len(values) > 1:
+        infos.append(
+            f"{tag} 展开了 {len(values)} 份（{var} = "
+            + ", ".join(str(v) for v in values[:6])
+            + ("…" if len(values) > 6 else "") + "）"
+        )
+    for v in values:
+        sub_env = {**env, var: v}
+        sub_body = _subst_genvar(body, var, v)
+        # origin 用同一个 tag（**不带**循环变量的值）—— 带上的话每一轮
+        # 的出处都不同，后面的等价合并就认不出它们是同一个 generate 的
+        # 各份拷贝，图上会出现 4 个一模一样的框。
+        sub_items, refusals, sub_infos = _expand_text(sub_body, body_line, sub_env, tag)
+        items.extend(sub_items)
+        infos.extend(sub_infos)
+        if refusals:
+            return [], refusals, []
+    return items, [], infos
+
+
+def _expand_if(region_text: str, content_line: int, env: dict[str, int],
+               origin: str) -> tuple[list[_GenItem], list[str], list[str]]:
+    """展开一个 if generate：算出条件，只保留**成立的那一支**。
+
+    这就是参数化结构图的意义所在 —— 一份源码对应多个不同的电路，
+    图只画当前参数取值下的那一个。哪一支被丢掉必须写在说明里，
+    否则读者会以为源码里根本没有另一支。
+    """
+    k = region_text.find("(")
+    if k < 0 or not region_text.lstrip().startswith("if"):
+        return [], ["generate 的 if 形式认不出来，这块不展开"], []
+    cond_s, after = _paren_group(region_text, k)
+    kws = _split_if_else(region_text[after:])
+    if kws is None:
+        return [], ["generate 的 if / else 切不出来（嵌套太怪），这块不展开"], []
+    then_s, then_off, else_s, else_off = kws
+
+    c = eval_const(cond_s, env)
+    # 标签一律在**去 begin-end 外壳之前**取：去了壳 `begin : buf` 就没了，
+    # 后取永远是空串（这条踩过：说明里写成了"只画了 else 那一支"）。
+    then_lbl = _gen_label(then_s)
+    else_lbl = _gen_label(else_s or "")
+    # 标签要按**实际取到的那一支**取：`if (c) begin : a ... end else begin : b ... end`
+    # 在 c 为假时画的是 b，那时把块标成 `generate a` 就是指着源码里
+    # 根本没画出来的那块说"就是它"。取错了比不取更坏。
+    taken_label = then_lbl if c else else_lbl
+    tag = f"generate {taken_label}" if taken_label else "generate if"
+    if c is None:
+        return [], [
+            f"generate if 的条件 {cond_s.strip()} 算不出来，两块内容都画不了"
+            f"（**只有一支是真的**，画哪一支都会误导）"
+        ], []
+    if c:
+        then_s, inner_off = _unwrap_begin(then_s)
+        then_line = content_line + _line_of(region_text, after + then_off + inner_off) - 1
+        items, refusals, infos = _expand_text(then_s, then_line, env, tag)
+        drawn = then_lbl or "then 那一支"
+        dropped = f"else 那一支（{else_lbl}）" if else_lbl else ("else 那一支" if else_s else "")
+    else:
+        if not else_s:
+            # 条件不成立又没有 else：这个 generate 什么都不产生。
+            # 和 for 的 0 次循环一样，合法，但要说一声。
+            return [], [], [
+                f"generate if 按 {cond_s.strip()} = 0 取真，条件不成立又没有 else，"
+                f"没有画出任何东西"
+            ]
+        else_s, inner_off = _unwrap_begin(else_s)
+        else_line = content_line + _line_of(region_text, after + else_off + inner_off) - 1
+        items, refusals, infos = _expand_text(else_s, else_line, env, tag)
+        drawn = else_lbl or "else 那一支"
+        dropped = f"then 那一支（{then_lbl}）" if then_lbl else "then 那一支"
+    if refusals:
+        return [], refusals, []
+    if dropped:
+        infos = list(infos) + [
+            f"generate if 按 {cond_s.strip()} 取真（= {int(bool(c))}），"
+            f"只画了 {drawn}，{dropped}没画 —— 源码里还在，换组参数就会是另一张图"
+        ]
+    return items, [], infos
+
+
+def _split_if_else(text: str) -> tuple[str, int, str | None, int] | None:
+    """把 `if` 后面剩下的部分切成 (then 体, then 偏移, else 体, else 偏移)。
+
+    偏移是相对传入 text 的起点，调用方拿它去算行号（行号比切出来的
+    文本本身更耐用：文本长度会随循环变量替换而变）。else 不存在时给 None。
+    """
+    t = text
+    n = len(t)
+    # then 体：跳过空白
+    i = 0
+    while i < n and t[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        return None
+    end = _stmt_end(t, i)
+    then_s = t[i:end]
+    j = end
+    while j < n and t[j] in " \t\r\n":
+        j += 1
+    if j < n and t.startswith("else", j) and not (j + 4 < n and (t[j + 4].isalnum() or t[j + 4] == "_")):
+        k = j + 4
+        while k < n and t[k] in " \t\r\n":
+            k += 1
+        if k >= n:
+            return then_s, i, None, 0
+        e2 = _stmt_end(t, k)
+        return then_s, i, t[k:e2], k
+    return then_s, i, None, 0
+
+
+def _gen_label(body: str) -> str:
+    """取 `begin : 名字` 里的名字。"" on failure."""
+    m = re.match(r"\s*begin\s*:\s*([A-Za-z_]\w*)", body)
+    return m.group(1) if m else ""
+
+
+def _expand_text(text: str, base_line: int, env: dict[str, int],
+                 origin: str) -> tuple[list[_GenItem], list[str], list[str]]:
+    """把一段模块体文本展开成普通语句列表。
+
+    返回 (语句, 拒绝理由, 说明)。**拒绝时语句列表是空的** —— 那块区域
+    整段从正常解析里抹掉了，绝不让它的内容漏进普通路径变成垃圾节点。
+
+    `base_line` 是 text[0] 在文件里的行号 —— 行号一律**在替换循环变量之前**
+    从原文本算出来，所以替换串多长都不影响它。
+    """
+    regions = _scan_regions(text)
+    if not regions:
+        out: list[_GenItem] = []
+        for stmt, ln in iter_statements(text):
+            if stmt.strip():
+                out.append(_GenItem(stmt, base_line + ln - 1, origin))
+        return out, [], []
+
+    refusals: list[str] = []
+    infos: list[str] = []
+    items: list[_GenItem] = []
+    masked = text
+    for r in regions:
+        seg = text[r.start:r.end]
+        seg_line = base_line + r.line - 1
+        if r.kind == "case":
+            refusals.append(
+                f"第 {seg_line} 行有 case generate：本工具不展开 case，"
+                f"内部结构没画（case 分支的 `值 : 语句` 切不准，切错会静默丢分支，"
+                f"宁可不画）"
+            )
+            masked = _blank(masked, r.start, r.end)
+            continue
+        if r.kind in ("function", "task"):
+            # 整个 function / task 抹掉，只留一句说明。不是"画不了"，
+            # 是**不该画** —— 它是个被调用的黑盒，不是数据通路。
+            refusals.append(
+                f"第 {seg_line} 行有 {r.kind}：调用它的地方按黑盒处理，内部不展开"
+            )
+            masked = _blank(masked, r.start, r.end)
+            continue
+        if r.kind == "generate":
+            inner = _region_inner(seg)
+            inner_line = seg_line + _line_of(seg, seg.find("generate") + 8) - 1
+            sub, sub_ref, sub_info = _expand_text(inner, inner_line, env, origin)
+        elif r.kind == "for":
+            sub, sub_ref, sub_info = _expand_for(seg, seg_line, env, origin)
+        else:
+            sub, sub_ref, sub_info = _expand_if(seg, seg_line, env, origin)
+        if sub_ref:
+            # 这一块算不出来：**只丢它自己**，模块里手写的那部分照画。
+            # 丢整张图是过度反应 —— 其余部分的连接关系是对的，而警告
+            # 会写在图上，说明"这块区域没画进去"。反过来，如果把
+            # 算不出来的 generate 里那些 assign 当成顶层 assign 画出来，
+            # 就成了一张看着合理但错的图，那才是必须避免的。
+            refusals.extend(sub_ref)
+        else:
+            infos.extend(sub_info)
+            items.extend(sub)
+        masked = _blank(masked, r.start, r.end)
+
+    for stmt, ln in iter_statements(masked):
+        if stmt.strip():
+            items.append(_GenItem(stmt, base_line + ln - 1, origin))
+    items.sort(key=lambda it: it.line)
+    return items, _dedup(refusals), _dedup(infos)
+
+
+def _dedup(seq: list[str]) -> list[str]:
+    """去重且保持顺序。嵌套循环会让同一条说明按外层圈数重复 N 遍
+    （`row` 跑 2 圈，里面的 `col` 说明就攒了 2 条一模一样的），
+    报两遍一模一样的展开说明只会让人以为有两处问题。"""
+    out: list[str] = []
+    for s in seq:
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def _region_inner(seg: str) -> str:
+    """`generate ... endgenerate` 之间的内容。"""
+    k = seg.find("generate")
+    body = seg[k + len("generate"):] if k >= 0 else seg
+    e = body.rfind("endgenerate")
+    return body[:e] if e >= 0 else body
+
+
+_BEGIN_END_RE = re.compile(r"^\s*begin(?:\s*:\s*[A-Za-z_]\w*)?\s*")
+
+
+def _unwrap_begin(text: str) -> tuple[str, int]:
+    """去掉 `begin : 名字 ... end` 的外壳，返回 (内部文本, 内部相对原点的偏移)。
+
+    **必须**做这一步：循环体/分支体的典型写法就是包一层 begin-end，
+    而 iter_statements 会把整个 begin-end 当成**一条**语句交出来
+    （那个行为是给 always 块用的，这里不适用）。不去壳的话，
+    `_expand_text` 在里面找不到任何可解析的语句，展开出来就是空的 ——
+    图上是空的，却谁也不报错，这正是最坏的一种失败。
+
+    带上偏移是为了让行号还能算准；去壳后文本整体前移了，不留偏移的话
+    行号会少算几行。
+    """
+    m = _BEGIN_END_RE.match(text)
+    if not m:
+        return text, 0
+    e = text.rfind("end")
+    if e < m.end():
+        return text, 0
+    if text[e + 3:].strip():
+        # `end` 后面还有东西，说明这个 end 不是配对的终止符（八成是
+        # `end else` 这种已经被切开的尾巴跑进来了），不敢去壳
+        return text, 0
+    return text[m.end():e], m.end()
 
 
 def _parse_module(text: str, line: int, filename: str) -> Module:
@@ -418,9 +1404,13 @@ def _parse_module(text: str, line: int, filename: str) -> Module:
         if close < 0:
             raise ValueError("参数表的括号不配对")
         for chunk in _split_top_commas(text[open_pos + 1:close]):
-            nm = re.search(r"\b(?:parameter|localparam)?\s*([A-Za-z_]\w*)\s*=", chunk)
+            # 名字后面的默认值要**一起收下来** —— 参数化结构图的全部
+            # 依据就是这个默认值（除非例化处覆盖，那属于调用方的事）。
+            nm = re.search(r"\b(?:parameter|localparam)?\s*([A-Za-z_]\w*)\s*=\s*(.*)",
+                           chunk, re.S)
             if nm:
                 mod.params.append(nm.group(1))
+                mod.param_pairs.append((nm.group(1), nm.group(2).strip()))
         body_start = close + 1
 
     # ---- 端口表 ( ... ) ----
@@ -436,10 +1426,18 @@ def _parse_module(text: str, line: int, filename: str) -> Module:
         header_ports = _split_top_commas(text[open_pos + 1:close])
         body_start = close + 1
 
-    _parse_ansi_ports(mod, header_ports)
-
     body_end = text.rfind("endmodule")
     body = text[body_start:body_end if body_end > 0 else len(text)]
+
+    # ---- 参数环境 ----
+    # 模块体里的 parameter / localparam 也算参数（而且**模块内可见**），
+    # 所以要在解析端口和语句之前先把它们连同默认值一起收齐。
+    # 不先收集的话，`localparam W = 8;` 声明在端口下面时，
+    # 端口上的 `[W-1:0]` 就永远算不出位宽。
+    _collect_body_param_pairs(mod, body)
+    mod.param_env, mod.param_failed = build_param_env(mod.param_pairs)
+
+    _parse_ansi_ports(mod, header_ports)
 
     # ---- 模块体 ----
     # iter_statements(body) 给出的行号是**相对 body** 的。
@@ -447,11 +1445,79 @@ def _parse_module(text: str, line: int, filename: str) -> Module:
     # body 在模块文本里的行偏移 + 模块文本在文件里的行偏移。
     # 不补的话每个模块都从"第 1 行"开始报，等于没有行号。
     line_base = (line - 1) + (_line_of(text, body_start) - 1)
-    for stmt, stmt_line in iter_statements(body):
-        _classify_statement(mod, stmt, stmt_line + line_base)
+    items, refusals, infos = _expand_text(body, line_base + 1, mod.param_env, "")
+    mod.unsupported.extend(refusals)
+    mod.gen_notes.extend(infos)
 
+    for it in items:
+        _classify_statement(mod, it.text, it.line, it.origin)
+
+    _merge_repeats(mod)
     _collect_unknowns(mod)
     return mod
+
+
+_PARAM_STMT_RE = re.compile(
+    r"^\s*(?:parameter|localparam)\b(.*)$", re.S)
+
+
+def _collect_body_param_pairs(mod: Module, body: str) -> None:
+    """把模块体里的 `parameter X = 表达式;` / `localparam Y = ...;` 收进 param_pairs。
+
+    只按顶层语句扫，不看 generate 里面的（那里面的 localparam 作用域在
+    块内，属于另一回事，本工具不处理）。
+    """
+    for stmt, _ in iter_statements(body):
+        m = _PARAM_STMT_RE.match(stmt)
+        if not m:
+            continue
+        decl = m.group(1)
+        # `parameter [3:0] X = 4;` —— 位宽是可选的，先抠掉
+        drm = _RANGE_RE.search(decl)
+        if drm and "=" in decl and drm.start() < decl.index("="):
+            decl = decl[:drm.start()] + " " + decl[drm.end():]
+        for chunk in _split_top_commas(decl):
+            m2 = re.match(r"\s*([A-Za-z_]\w*)\s*(?:=\s*(.*))?$", chunk.strip(), re.S)
+            if not m2:
+                continue
+            name = m2.group(1)
+            if name in mod.params:
+                continue
+            default = (m2.group(2) or "").strip()
+            mod.params.append(name)
+            mod.param_pairs.append((name, default))
+
+
+def _merge_repeats(mod: Module) -> None:
+    """把 generate 展开出来的**等价语句**合并成一条，记下它代表几份。
+
+    `for (i=0;i<4;i=i+1) assign y[i] = ~a[i];` 展开后是 4 条 assign，
+    信号级的图上看（位下标已经被抹掉）它们**一模一样**。画 4 个同样的框
+    既占地方又让人以为是 4 段不同的逻辑，所以合并成一条并标 `×4`。
+
+    只合并 origin 非空的块 —— 手写的两条相同 assign 也合并的话，
+    `×2` 这个标注就成了谎话（它们不是同一个 generate 展开出来的）。
+    """
+    for coll, maker in ((mod.blocks, "block"), (mod.instances, "inst")):
+        seen: dict[tuple, object] = {}
+        kept: list = []
+        for it in coll:
+            if not it.origin:
+                kept.append(it)
+                continue
+            if maker == "block":
+                key = (it.origin, it.kind, it.label, tuple(it.lhs), tuple(it.rhs),
+                       it.note, it.clock, it.reset)
+            else:
+                key = (it.origin, it.module,
+                       tuple((p, _norm_conn(c)) for p, c in it.conns),
+                       tuple(sorted(it.params.items())))
+            if key in seen:
+                seen[key].repeat += 1
+                continue
+            seen[key] = it
+            kept.append(it)
+        coll[:] = kept
 
 
 # 端口声明里除了信号名之外的词
@@ -498,7 +1564,7 @@ def _parse_ansi_ports(mod: Module, chunks: list[str]) -> None:
 
         if cur_dir is None or not name:
             continue
-        w, wtext = _width_from(cur_width_text) if cur_width_text else (None, "")
+        w, wtext = _width_from(cur_width_text, mod.param_env) if cur_width_text else (None, "")
         mod.ports.append(Port(name=name, direction=cur_dir, width_text=wtext,
                               width=w, signed=cur_signed, reg=cur_reg,
                               line=mod.line))
@@ -510,7 +1576,7 @@ def _first_ident(s: str) -> str:
     return m.group(1) if m else ""
 
 
-def _classify_statement(mod: Module, stmt: str, line: int) -> None:
+def _classify_statement(mod: Module, stmt: str, line: int, origin: str = "") -> None:
     s = stmt.strip()
     if not s:
         return
@@ -518,6 +1584,8 @@ def _classify_statement(mod: Module, stmt: str, line: int) -> None:
     if not head_m:
         return
     head = head_m.group(1)
+    # 出处供 _parse_assign / _parse_always / _parse_instance 读取（见 Module._cur_origin）
+    mod._cur_origin = origin
 
     if head in _DIRECTIONS:
         _parse_body_port(mod, s, head, line)
@@ -534,10 +1602,41 @@ def _classify_statement(mod: Module, stmt: str, line: int) -> None:
     if head == "initial":
         mod.unsupported.append(f"第 {line} 行有 initial 块：只存在于测试台，不画进结构图")
         return
-    if head == "generate":
+    if head == "genvar":
+        # genvar 是展开期的量，不是电路里的信号，画进图里只会多一个悬空节点
+        return
+    if head == "endgenerate":
+        # generate 区域在 _expand_text 里已经被整段抹掉了，正常走不到这里。
+        # 真走到了说明边界没配平（比如嵌套 generate 的脏写法），
+        # 留一条记录好过静默忽略。
         mod.unsupported.append(
-            f"第 {line} 行有 generate：展开需要知道参数的实际取值，靠源码推不出来，"
-            f"内部结构图已停用"
+            f"第 {line} 行有个落单的 endgenerate：generate 边界没配平，这块没解析"
+        )
+        return
+    if head == "generate":
+        # 正常路径上 generate 区域已经被展开并抹掉了，能走到这里只有两种情况：
+        # 展开失败（拒绝理由已经记在 unsupported 里了），或者编译器不允许的
+        # 脏写法。两条都只需要留下说明。
+        mod.unsupported.append(
+            f"第 {line} 行有 generate，但没能展开（见上面的具体理由），"
+            f"这块区域里的结构没有画进图里"
+        )
+        return
+    if head in ("for", "if", "case"):
+        # 同上：这也应该在展开阶段就被处理掉。落到这儿说明边界没认出来，
+        # 硬按例化解析会得到一堆以 `for` / `if` 命名的假节点，宁可只报一声。
+        mod.unsupported.append(
+            f"第 {line} 行有个没能识别的 {head} generate：边界没认出来，这块没解析"
+        )
+        return
+    if head == "else":
+        # `if (c) begin ... end else begin ... end` 的边界要是切在第一个
+        # `end` 上，else 那一支就会掉到这里。从前它会被 _parse_instance
+        # 默默吃掉 —— 图上看不出少了东西，源码里的那一支就这么消失了。
+        # 这种"静默丢结构"是最坏的失败，所以至少要说出来。
+        mod.unsupported.append(
+            f"第 {line} 行有个落单的 else：if generate 的分支边界没切对，"
+            f"else 那一支里的结构没有画进图里"
         )
         return
     if head in ("function", "task"):
@@ -557,7 +1656,7 @@ def _parse_body_port(mod: Module, s: str, direction: str, line: int) -> None:
         pass
     rm = _RANGE_RE.search(s)
     wtext = rm.group(0) if rm else ""
-    w, _ = _width_from(wtext) if wtext else (None, "")
+    w, _ = _width_from(wtext, mod.param_env) if wtext else (None, "")
     names_part = s[rm.end():] if rm else re.sub(r"^\s*" + direction, "", s)
     for nm in _split_top_commas(names_part.rstrip(";").strip()):
         name = _first_ident(nm)
@@ -571,7 +1670,7 @@ def _parse_body_decl(mod: Module, s: str, line: int) -> None:
     kind_m = re.search(r"\b(wire|reg|logic|integer|real|time|bit)\b", s)
     rm = _RANGE_RE.search(s)
     wtext = rm.group(0) if rm else ""
-    w, _ = _width_from(wtext) if wtext else (None, "")
+    w, _ = _width_from(wtext, mod.param_env) if wtext else (None, "")
     kind = kind_m.group(1) if kind_m else "parameter"
 
     if not kind_m:
@@ -601,8 +1700,9 @@ def _parse_assign(mod: Module, s: str, line: int) -> None:
         mod.unsupported.append(f"第 {line} 行的 assign 写法认不出来，已跳过")
         return
     lhs_names = _assign_targets(m.group(1))
-    rhs_names = _expr_signals(m.group(2))
-    mod.blocks.append(Block(kind="assign", line=line, lhs=lhs_names, rhs=rhs_names))
+    rhs_names = _expr_signals(m.group(2), set(mod.params))
+    mod.blocks.append(Block(kind="assign", line=line, lhs=lhs_names, rhs=rhs_names,
+                            origin=mod._cur_origin))
 
 
 def _assign_targets(text: str) -> list[str]:
@@ -663,12 +1763,13 @@ def _parse_always(mod: Module, s: str, line: int) -> None:
     body_start = m.end() if m else s.find("*") + 1
     body = s[body_start:]
 
-    lhs, rhs = _scan_always_body(body)
+    lhs, rhs = _scan_always_body(body, set(mod.params))
     nonblocking = _has_depth0_assignment(body, "<=")
 
     blk = Block(kind="always", line=line, lhs=lhs, rhs=rhs,
                 clock=clock, reset=reset, nonblocking=nonblocking,
-                sensitivity=sens if sens != "*" else "*")
+                sensitivity=sens if sens != "*" else "*",
+                origin=mod._cur_origin)
     if clock and not nonblocking:
         blk.note = "时序块里用了阻塞赋值 =，请确认这是你想要的"
     mod.blocks.append(blk)
@@ -734,7 +1835,7 @@ def _has_depth0_assignment(text: str, op: str) -> bool:
     return any(text[a:a + ln] == op for a, ln, _ in _depth0_assignments(text))
 
 
-def _scan_always_body(body: str) -> tuple[list[str], list[str]]:
+def _scan_always_body(body: str, drop: set[str] | None = None) -> tuple[list[str], list[str]]:
     """从 always 块体里提取 (被赋值的信号, 被读到的信号)。
 
     做法：逐条语句找出所有深度 0 的赋值，把**左侧名字**从文本里抠掉，
@@ -777,7 +1878,7 @@ def _scan_always_body(body: str) -> tuple[list[str], list[str]]:
         pieces.append(stmt[prev:])
         read_text_parts.append(" ".join(pieces))
 
-    return lhs, _expr_signals(" ".join(read_text_parts))
+    return lhs, _expr_signals(" ".join(read_text_parts), drop)
 
 
 # 数字字面量。必须先抠掉再找标识符 ——
@@ -792,13 +1893,29 @@ _LITERAL_RE = re.compile(
 )
 
 
-def _expr_signals(expr: str) -> list[str]:
-    """表达式里出现的、**不是关键字也不是数字**的标识符（保持出现顺序、去重）。"""
-    cleaned = _LITERAL_RE.sub(" ", expr)
+_SYSFUNC_RE = re.compile(r"\$[A-Za-z_]\w*")
+
+
+def _expr_signals(expr: str, drop: set[str] | None = None) -> list[str]:
+    """表达式里出现的、**不是关键字也不是数字**的标识符（保持出现顺序、去重）。
+
+    `drop` 是"这些名字不是信号"，传模块的参数名集合。必须传 ——
+    `assign y[i] = a[r*C + c];` 展开后是 `a[(0)*(3)+(0)]`，里面的 C 是
+    **参数**不是信号。不过滤的话：位下标里出现的参数会被算进"读"集合，
+    框里会写成"读 a, C"；而且它不在端口/声明表里，会被报成
+    「未在本模块声明的名字」—— 一条完全错误的警告。
+    """
+    drop = drop or set()
+    # `$clog2` / `$signed` 这些系统函数名必须整段抠掉：`\b` 在 `$` 和 `c`
+    # 之间是断的，所以 `$clog2` 会被当成一个叫 `clog2` 的标识符。
+    # 曾实测：`addr == i[$clog2(DEPTH)-1:0]` 报出「未在本模块声明的名字：clog2」，
+    # 一条纯属虚构的警告。
+    cleaned = _SYSFUNC_RE.sub(" ", expr)
+    cleaned = _LITERAL_RE.sub(" ", cleaned)
     out: list[str] = []
     for m in _IDENT_RE.finditer(cleaned):
         w = m.group(1)
-        if w in _KEYWORDS:
+        if w in _KEYWORDS or w in drop:
             continue
         if w not in out:
             out.append(w)
@@ -845,8 +1962,11 @@ def _parse_instance(mod: Module, s: str, line: int) -> None:
         else:
             conns.append(("", chunk))
 
+    # 实例名：generate 展开出来的重名是**正常**的（同一个 `u_f` 被复制 N 份，
+    # 真正的唯一名字由层次名给出）。所以这里不查重，交给 _merge_repeats 合并。
     mod.instances.append(Instance(module=sub, name=inst_name,
-                                  conns=conns, params=params, line=line))
+                                  conns=conns, params=params, line=line,
+                                  origin=mod._cur_origin))
 
 
 def _resolve_instance_outputs(design: Design) -> None:
@@ -1182,7 +2302,8 @@ def render_module_svg(mod: Module, out: Path, design: Design | None = None) -> P
         if isinstance(b, Instance):
             h = max(38.0, 20 + len(b.conns) * 14 + (14 if b.params else 0))
         else:
-            lines = 1 + (1 if b.lhs else 0) + (1 if b.rhs else 0)
+            # 标题 + 读 + 写 + 出处（generate 展开的才有第四行）
+            lines = 1 + (1 if b.lhs else 0) + (1 if b.rhs else 0) + (1 if b.origin else 0)
             h = max(38.0, 16 + lines * 15)
         blk_h.append(h)
 
@@ -1196,7 +2317,7 @@ def render_module_svg(mod: Module, out: Path, design: Design | None = None) -> P
     # ---- 源信号 ----
     y = TOP + (h_all - h_src) / 2
     for name in srcs:
-        _signal_pill(svg, name, mod.width_of(name), COL_X[0], y, COL_W[0], "in")
+        _signal_pill(svg, name, mod.width_label_of(name), COL_X[0], y, COL_W[0], "in")
         positions[name] = y + 12
         y += ROW_H
 
@@ -1211,7 +2332,7 @@ def render_module_svg(mod: Module, out: Path, design: Design | None = None) -> P
     # ---- 被驱动的信号 ----
     y = TOP + (h_all - h_sink) / 2
     for name in sinks:
-        _signal_pill(svg, name, mod.width_of(name), COL_X[2], y, COL_W[2], "out")
+        _signal_pill(svg, name, mod.width_label_of(name), COL_X[2], y, COL_W[2], "out")
         positions[name] = y + 12
         y += ROW_H
 
@@ -1275,6 +2396,10 @@ def render_module_svg(mod: Module, out: Path, design: Design | None = None) -> P
             "⚠ 未在本模块声明的名字（按常量/函数/层次引用处理，未画成节点）："
             + "、".join(mod.unknown_names[:6])
             + ("…" if len(mod.unknown_names) > 6 else ""), "warn"))
+    # generate 的展开说明。用 sub 而不是 warn —— 它是**画出来了**，
+    # 只是在告诉你"画的是这一组参数取值下的那一份"。
+    for msg in mod.gen_notes:
+        notes.append((f"· generate：{msg}", "sub"))
     if not notes:
         notes.append(("所有 assign / always 都已解析并画出", "sub"))
 
@@ -1314,12 +2439,11 @@ def _curve(x0: float, y0: float, x1: float, y1: float) -> str:
             f"C {mx:.1f} {y0:.1f} {mx:.1f} {y1:.1f} {x1:.1f} {y1:.1f}")
 
 
-def _signal_pill(svg: Svg, name: str, width: int | None,
+def _signal_pill(svg: Svg, name: str, width_label: str,
                  x: float, y: float, w: float, side: str) -> None:
+    """`width_label` 是**已经格式化好的**标注（可能空、可能是 `[WIDTH-1:0]`）。"""
     h = 20.0
-    label = name
-    if width and width > 1:
-        label += f" [{width}]"
+    label = name + (" " + width_label if width_label else "")
     if side == "in":
         svg.rect(x, y, w, h, fill="var(--box)", stroke="var(--line)", rx=10)
         svg.text(x + 10, y + h / 2, label, cls="lbl")
@@ -1328,11 +2452,17 @@ def _signal_pill(svg: Svg, name: str, width: int | None,
         svg.text(x + 10, y + h / 2, label, cls="lbl")
 
 
+def _repeat_suffix(n: int) -> str:
+    """generate 展开合并后的份数标注。1 份不标 —— 标注只在有信息时出现。"""
+    return f"  ×{n}" if n > 1 else ""
+
+
 def _block_box(svg: Svg, b, x: float, y: float, w: float, h: float) -> None:
     if isinstance(b, Instance):
         sub = ""
         if b.params:
             sub = "#(" + ", ".join(f"{k}={v}" for k, v in list(b.params.items())[:2]) + ")"
+        sub += _repeat_suffix(b.repeat)
         svg.rect(x, y, w, h, fill="var(--box)", stroke="var(--inst)", rx=4)
         svg.text(x + 12, y + 15, f"{b.module}", cls="lbl")
         svg.text(x + 12 + _tw(b.module) + 10, y + 15 + 1, sub, cls="sub")
@@ -1360,6 +2490,10 @@ def _block_box(svg: Svg, b, x: float, y: float, w: float, h: float) -> None:
     if b.lhs:
         svg.text(x + 12, y + 47, "写 " + ", ".join(b.lhs[:4])
                  + ("…" if len(b.lhs) > 4 else ""), cls="sub")
+    if b.origin:
+        # 出处写在左下角：这条语句不是手写的顶层语句，是 generate 展开出来的。
+        # 没有这个标注，读者会去源码里找一行根本不存在的 assign。
+        svg.text(x + 12, y + 62, b.origin + _repeat_suffix(b.repeat), cls="sub")
     if b.note:
         svg.text(x + 12, y + h - 12, "⚠ " + b.note, cls="warn")
 

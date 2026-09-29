@@ -20,10 +20,10 @@
 |---|---|---|
 | RTL 功能设计 | ✅ 完整（iverilog 仿真 + 自动判定） | — |
 | 测试台与验证 | ✅ 完整（自检测试台、随机激励、覆盖率概念） | UVM 类库、商业仿真器特性；代码覆盖率需装 verilator |
-| 逻辑综合 | ⚠️ 装 **yosys** 能真综合、看门数、比状态编码；**零下载**的 iverilog `-t blif`（门级网表）/ `-t sizer`（FF 与门数估算）也能出真实数字。⚠️ 实测：OSS CAD Suite 的 yosys 分组件装完**跑不起来**（见下），所以「装了 yosys」目前不等于能综合 | ❌ 跑不了 DC / Genus，没有工艺库，面积/时序不是真实数字 |
+| 逻辑综合 | ⚠️ 装 **yosys** 能真综合、看门数、比状态编码（**已实测可用**，Yosys 0.69+154）；**零下载**的 iverilog `-t blif`（门级网表）/ `-t sizer`（FF 与门数估算）也能出真实数字 | ❌ 跑不了 DC / Genus，没有工艺库，面积/时序不是真实数字 |
 | 静态时序分析 | ⚠️ 只能讲原理 + 手算 slack + 读真实报告样例 | ❌ **Windows 原生无方案**（OpenSTA 需 WSL2）。没有真实 slack |
 | Lint / CDC 检查 | ⚠️ 自带 `_lint.py` 只覆盖锁存器；装 **verilator** 可补真 lint（位宽/组合环/多驱动）；装 **verible** 可补编码规范检查 | ❌ CDC 没有成熟开源工具，只能人工审查 + 形式验证辅助 |
-| 形式验证 | ⚠️ 装 OSS CAD Suite 的 **sby / eqy / z3** 可做属性验证与等价性检查 | ❌ 规模和易用性远不如商业工具 |
+| 形式验证 | ⚠️ 装 OSS CAD Suite 的 **sby / eqy / z3** 可做属性验证与等价性检查（**已实测可用**：sby + `smtbmc z3` 的 k-induction 作业跑出 `DONE (PASS, rc=0)`） | ❌ 规模和易用性远不如商业工具 |
 | DFT / 低功耗 | ⚠️ 只能讲概念和接口 | ❌ **Windows 原生无方案**。且 L3-14 / L3-13 大纲本来就没承诺动手 |
 
 **装不装由你定，缺工具不阻塞开课。** 跑 `python tools/check_tools.py --level L3` 看这一级缺什么、缺了会怎样、装什么能补，然后 `python tools/setup_tools.py --install <id> --lock` 装到仓库里（不影响系统环境）。
@@ -32,7 +32,11 @@
 
 ⚠️ **纠一个容易想当然的地方：这条链的瓶颈是编译器，不是 make。** 实测过了——make 那步可以用 `mingw32-make` 顶替（verilator 认 `MAKE` 环境变量），但本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017 年），而这个 verilator 是按 **GCC 15.2.1** 配置的，之后连撞四个坑：`-fcf-protection=none` 不认（GCC 8+ 才有）、`verilated.mk` 里 `python3` 找不到、`GetProcessMemoryInfo` 缺 `-lpsapi`、最后链接报 `WinMain` 未定义。逐个绕过去也不牢靠。**结论：要打通得换现代 mingw-w64（`mingw` 条目，约 250 MB），补一个 make 解决不了问题。**
 
-⚠️ **OSS CAD Suite 的分组件 Windows 资产不自包含**，这一条影响 L3 好几项能力。`windows-x64-yosys.tgz` 装完，`yosys.exe` 启动即 `STATUS_DLL_NOT_FOUND`——它要 `libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1` 一整组运行时 DLL，而组件里一个都不带，Python 的 `python3` 组件也不带。表现是**一个字节输出都没有、也没有报错信息**，只看「文件在不在」必然误判成装好了。`check_tools.py` 现在会把它显示成 `⚠ 已安装但不可用`，理由写清楚。**形式验证那几项（sby / eqy / z3）依赖同一套运行时，很可能同样情况，本仓库尚未实测**——装之前先按这个预期降低期待。
+⚠️ **OSS CAD Suite 只装整包，不要装分组件**（2026-09-28 实测的分组件，2026-09-29 被整包推翻）。分组件 Windows 资产**不自包含**：`windows-x64-yosys.tgz` 装完，`yosys.exe` 启动即 `STATUS_DLL_NOT_FOUND`——它要 `libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1` 一整组运行时 DLL，而组件里一个都不带。表现是**一个字节输出都没有、也没有报错信息**，只看「文件在不在」必然误判成装好了。
+
+根因不是"缺几个 DLL、补上就行"：整包与分组件带的 `libstdc++-6.dll` 存在 **C 库 ABI 分裂**（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），拿 bleyer iverilog 的同名 DLL 顶上只会把 `STATUS_DLL_NOT_FOUND (0xC0000135)` 换成 `STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)`，**不能混用**。所以清单里 7 个条目（yosys / verilator / sby / eqy / z3 / oss-utils / oss-system-resources）现在统一指向**同一个整包**，`setup_tools.py` 按 `(repo, tag, asset)` 判重，只下一次、只解一次。
+
+整包（572 MB）**已实测全部能用**：`yosys 0.69+154`、`verilator_bin 5.053`、`z3 4.15.5`、`sby` / `eqy` / `slang 11.0.448` / `gtkwave 4.0.0` 逐一起得来，形式验证真跑通了一个 k-induction 作业。代价是 `.tools/oss` 占 **2.1 GB**。`check_tools.py` 的判据是 `found and usable`（真跑一次功能自检），所以「文件在」不会被当成「能用」。
 
 **所以 L3 的教法会明确区分两类内容**：
 

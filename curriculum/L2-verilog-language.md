@@ -113,7 +113,13 @@ Verilog 有四种描述电路的方式，**要会用，更要知道什么时候�
 > | 二进制 | 2 | 17 | 6 slices |
 > | 独热 | 4 | 25 | 12 slices |
 >
-> 差异足够清楚。（注意 `-t sizer` **写文件不写 stdout**，不带 `-o` 会静默无输出，容易误以为它不可用。）装 yosys 多给的是**综合器自己挑编码**这一层——写状态名让它决定怎么编、再对比结果，iverilog 做不到。跑 `python tools/check_tools.py --level L2` 看当前状态。
+> 差异足够清楚。（注意 `-t sizer` **写文件不写 stdout**，不带 `-o` 会静默无输出，容易误以为它不可用。）
+>
+> 装 yosys 多给的是**综合器自己挑编码**这一层——不指定编码，让工具自己决定怎么编、再对比结果，iverilog 做不到。**2026-09-29 已接入**：`python tools/synth.py <设计.v> --top x --engine yosys --encoding-compare`。已实测同一份 4 状态机：one-hot 4 位状态寄存器 / 13 个门，binary 2 位 / 11 个门。
+>
+> ⚠️ **但它只支持 one-hot 和 binary 两种。** yosys 的 `fsm_recode` 没有 gray / johnson，传 `gray` 会直接报错——本讲讲三种编码，**综合器能替你挑的只有两种，格雷必须自己在 RTL 里写**。别以为「装了 yosys 就不用管编码了」。
+>
+> 另注意 `-t sizer` 那个数字**量不出灰码的好处**（同一段 4 状态机，bin 和 gray 都是 2 FF / 21 门）：sizer 不做优化，只把同一份 `case` 结构翻译一遍。灰码的价值在**翻转次数**（省功耗），那一半得用 `python tools/toggle.py` 从波形里数——**综合器量不出来，yosys 也不做活动性分析**。跑 `python tools/check_tools.py --level L2` 看当前状态。
 
 ### 第七章：综合实战
 

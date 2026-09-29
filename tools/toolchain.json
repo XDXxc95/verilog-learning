@@ -163,7 +163,7 @@
         }
       },
       "note": "为什么单列成一项而不是混进 verilator：verilator 的 lint 和它的编译链是两回事，取决于两条不同的依赖（前者零额外依赖，后者要整套编译器）。混在一起写，使用者会以为装了 verilator 就有覆盖率。⚠ 候选里只有 winlibs 给 .zip：niXman/mingw-builds-binaries 只有 .7z（标准库解不了，而本仓库的原则是不运行下载来的可执行文件），skeeto/w64devkit 只有自解压 .7z.exe（同样违反该原则），MSYS2 的包是 .tar.zst（同样解不了）。所以 250 MB 这个体积是被规则卡出来的，不是没找更小的。⚠ 本项标了 repo_private：**只认装进 .tools/ 的这份，不用系统 PATH 上的 g++**。编译器的能不能用取决于版本而不是在不在 —— 系统上那个 mingw 7.3 会让 verilator 编出莫名其妙的一串错，而复用它省下的 250 MB 换来的是「查不出原因的失败」。",
-      "caveat": "装完还得让 verilator 用上它：verilator 调 make 时认 MAKE 环境变量，需要把 MAKE 指向本包的 mingw32-make.exe，并把 bin 前置到 PATH。这一步本仓库尚未实现（没有覆盖率接入代码），所以现在即使装了也只是「有编译器」，cov.code 依然标着缺口。"
+      "caveat": "装完还得让 verilator 用上它：verilator 调 make 时认 MAKE 环境变量，需要把 MAKE 指向本包的 mingw32-make.exe，并把 bin 前置到 PATH。这一步本仓库尚未实现（没有覆盖率接入代码），所以现在即使装了也只是「有编译器」。**注意 cov.code 装完仍然是缺口**——那条能力的 gap 是 `software+code`，本仓库还没有覆盖率接入代码，装上 mingw 只是把软件那一半补齐。"
     },
     {
       "id": "formal",
@@ -362,9 +362,16 @@
       ],
       "check": {
         "exe": "verible-verilog-lint",
-        "version_arg": "--version"
+        "version_arg": "--version",
+        "functional": {
+          "args": [
+            "--ruleset=none",
+            "tools/probe/vlearn_probe.v"
+          ],
+          "note": "真解析一次。`--ruleset=none` 关掉全部风格规则，于是**退出码只反映「能不能解析」**：合法文件 0，语法错文件 1（实测）。这样既证明进程起得来、又能读文件、解析器也确实在工作——只查 --version 三样都证明不了。"
+        }
       },
-      "note": "L3-04 编码规范那讲能用上——把「规范」变成可自动检查的规则。低优先级。"
+      "note": "L3-04 编码规范那讲能用上——把「规范」变成可自动检查的规则。低优先级。⚠️ 2026-09-29 更正：本项原先标 `gap: \"software\"`，好像装上就能用，而 `tools/` 里没有任何调用点——**装好了也跑不了**，所以改标 `software+code`。真接入时要先挑规则集：实测 `--ruleset=all` 打头两条是 `module-filename`（文件名与模块名一致）和 `port-name-suffix`（输入端口必须带 _i/_ni/_pi 后缀），都是 Google 内部约定而不是通用规范，直接放给学习者只会重演 verilator `-Wall` 那种「噪声大到开始整体忽略这个工具」。也正因为 `--ruleset` 默认值几乎是空的，**不显式挑就没有意义**。`--lint_fatal=false` 可以把退出码与「有没有风格违规」解耦，接入时用得上。"
     },
     {
       "id": "cocotb",
@@ -550,8 +557,8 @@
       "gap": "software",
       "impact": "degrades",
       "fallback": "手工把三种编码各写一遍，用 iverilog -t sizer 量 FF / 门数——零下载就能拿到真实的对比数字",
-      "integration": "tools/synth.py --compare（零下载粗粒度，量面积）；tools/toggle.py（零下载，量翻转 —— 灰码那一半）；装了 yosys 后可让综合器自己挑编码",
-      "note": "L2-40、综合⑥（三种写法 × 三种编码 = 9 份）的核心看点。仿真里三种编码行为完全一样，只有硬件代价能体现差异，而**代价分两半，得两个工具各量一半**。\n**① 面积那一半 → tools/synth.py。** ★ 但 sizer 这个层级量不出灰码的好处，别把它讲成「三种编码都不同」：实测同一段 4 状态机，bin 2 FF / 21 门、gray 2 FF / 21 门 —— **一模一样**，onehot 才是 4 FF / 41 门。原因是 sizer **不做优化**，只是把同一份 case 结构翻译一遍：常量从 00/01/10/11 换成 00/01/11/10，结构没变、宽度没变。它对「状态寄存器变宽」敏感，对「同宽度下换编码」不敏感。`check_synth.py` 里把 bin==gray 钉成了断言，将来若有人「改进」出差异会直接报红。\n**② 翻转那一半 → tools/toggle.py（零下载）。** 灰码真正的价值是少翻转、省功耗，而这一半**连 yosys 也量不出来**——综合器不做活动性分析，它不知道哪些跳变是「热的」。只有仿真知道。实测同一台 4 位计数器、同一套激励：二进制 st 变化 34 次、翻 63 位（1.85 位/次），格雷 34 次、翻 34 位（**恰好 1.00 位/次**）。\n★ 所以这一项**保留 requires yosys 只是为了让综合器自己挑编码**（那是另一件事：让工具替你做状态分配，而不是量你已经做好的分配）。编码取舍的教学**两半现在都能动手**，但 `impact: degrades` 仍算准确：没有 yosys 时「让工具自己挑」这个环节做不了。\n★ 转述翻转数时别越界：它**完全由激励决定**，是这次仿真的属性不是设计的属性；toggle.py 会在可比性不成立时拒绝给比值，那个 null 不是「没差别」。"
+      "integration": "tools/synth.py --engine yosys --encoding-compare（2026-09-29 接入：对同一份设计依次跑 auto/one-hot/binary 并出对比表；★ 表里带「状态机有没有被认出来」—— 没认出来就明说「本次没能比较」，绝不把三次相同的数字摆成一张看着像结论的表）；tools/synth.py（零下载粗粒度，iverilog sizer 量面积）；tools/toggle.py（零下载，量翻转 —— 灰码那一半）",
+      "note": "L2-40、综合⑥（三种写法 × 三种编码 = 9 份）的核心看点。仿真里三种编码行为完全一样，只有硬件代价能体现差异，而**代价分两半，得两个工具各量一半**。\n**① 面积那一半 → tools/synth.py。** ★ 但 sizer 这个层级量不出灰码的好处，别把它讲成「三种编码都不同」：实测同一段 4 状态机，bin 2 FF / 21 门、gray 2 FF / 21 门 —— **一模一样**，onehot 才是 4 FF / 41 门。原因是 sizer **不做优化**，只是把同一份 case 结构翻译一遍：常量从 00/01/10/11 换成 00/01/11/10，结构没变、宽度没变。它对「状态寄存器变宽」敏感，对「同宽度下换编码」不敏感。`check_synth.py` 里把 bin==gray 钉成了断言，将来若有人「改进」出差异会直接报红。\n**② 翻转那一半 → tools/toggle.py（零下载）。** 灰码真正的价值是少翻转、省功耗，而这一半**连 yosys 也量不出来**——综合器不做活动性分析，它不知道哪些跳变是「热的」。只有仿真知道。实测同一台 4 位计数器、同一套激励：二进制 st 变化 34 次、翻 63 位（1.85 位/次），格雷 34 次、翻 34 位（**恰好 1.00 位/次**）。\n★ 所以这一项**保留 requires yosys 只是为了让综合器自己挑编码**（那是另一件事：让工具替你做状态分配，而不是量你已经做好的分配）。编码取舍的教学**两半现在都能动手**，但 `impact: degrades` 仍算准确：没有 yosys 时「让工具自己挑」这个环节做不了。\n★ 转述翻转数时别越界：它**完全由激励决定**，是这次仿真的属性不是设计的属性；toggle.py 会在可比性不成立时拒绝给比值，那个 null 不是「没差别」。\n**③ 让综合器自己挑编码 → tools/synth.py --engine yosys（2026-09-29 接入）。**★ 但**只支持 one-hot 和 binary**：yosys 的 fsm_recode 没有 gray / johnson （`-encoding auto` 之外的其它值直接报错）。课程讲三种编码，综合器能替你挑的只有两种 —— 格雷必须自己在 RTL 里写。实测同一份 4 状态机：one-hot 4 位状态寄存器 / 13 个门，binary 2 位 / 11 个门。"
     },
     {
       "id": "synth.area",
@@ -565,8 +572,8 @@
       "gap": "software",
       "impact": "shrinks",
       "fallback": "iverilog -t sizer 可给 FF / 门数估算；再退一步只能目测结构图",
-      "integration": "tools/synth.py（零下载粗粒度）；yosys 给的是真正做优化+映射后的面积",
-      "note": "L2-14、以及「面积优先 vs 时序优先」那类约束取舍题。三点注意：(1) -t sizer 数的是**未映射逻辑**，不是真实面积，只能横向比不能当门数报告用；(2) 它的结果**写文件不写 stdout**，必须带 -o，否则看起来像什么都没发生（安静地什么都没输出，很容易误判成不可用）—— synth.py 已封好这个坑；(3) 既然不做优化，**同宽度换编码它一个数都不会变**（bin 和 gray 都是 2 FF / 21 门），拿它做编码取舍会得出「灰码没用」的错误结论，见 synth.encoding。\n★ 这个能力只管面积那一半。编码/状态机的**动态代价（翻多少位）综合器一概不问**，无论 sizer 还是 yosys 都不做活动性分析 —— 那一半在 tools/toggle.py，零下载。讲面积时必须说清「这只是代价的一半」，否则学习者会以为门数少就等于好。"
+      "integration": "tools/synth.py（零下载粗粒度：iverilog -t sizer）；tools/synth.py --engine yosys 给的是真正做了 opt + techmap + abc 之后的门数（2026-09-29 接入）。★ 仍**不是真实面积**：没有工艺库，abc 用的是内置的通用映射（$_AND_ / $_DFF_* 这些内部门），比 sizer 可信得多但仍只能横向比",
+      "note": "L2-14、以及「面积优先 vs 时序优先」那类约束取舍题。三点注意：(1) -t sizer 数的是**未映射逻辑**，不是真实面积，只能横向比不能当门数报告用；(2) 它的结果**写文件不写 stdout**，必须带 -o，否则看起来像什么都没发生（安静地什么都没输出，很容易误判成不可用）—— synth.py 已封好这个坑；(3) 既然不做优化，**同宽度换编码它一个数都不会变**（bin 和 gray 都是 2 FF / 21 门），拿它做编码取舍会得出「灰码没用」的错误结论，见 synth.encoding。\n★ 这个能力只管面积那一半。编码/状态机的**动态代价（翻多少位）综合器一概不问**，无论 sizer 还是 yosys 都不做活动性分析 —— 那一半在 tools/toggle.py，零下载。讲面积时必须说清「这只是代价的一半」，否则学习者会以为门数少就等于好。\n★ yosys 那条腿（--engine yosys）比 sizer 可信得多，但有两条自己的坑，都在 tools/_yosys.py 的模块头里写明了：(1) **非硬件 cell 会活到 abc 之后、退出码还是 0** —— 含 $display / #延迟 的设计能跑出「96 个 cell」而 iverilog 那条腿判它合不了；报告里 gate_count_meaningful 会翻 false，门数照给但标为不可当结论用。(2) **#延迟被静默丢弃**，日志里一句警告都没有。"
     },
     {
       "id": "synth.run",
@@ -580,8 +587,8 @@
       "gap": "software",
       "impact": "degrades",
       "fallback": "iverilog -t blif 能出工艺无关门级网表、-t sizer 能出 FF/门数估算（tools/synth.py，零下载）；再退一步才是讲原理 + 读报告样例 + 人工估算",
-      "integration": "tools/synth.py --netlist（零下载粗粒度）；装了 yosys 后可走完整综合与映射",
-      "note": "L3-05 综合原理、L3-06 综合日志读解。装了 yosys 之后这两讲可以从「读样例」升级为「自己跑出来再读」。但要注意两点：(1) yosys 是开源综合器，报告格式和 DC/Genus 不同，读解训练仍以真实商业报告样例为主；(2) 零下载的 iverilog 那条路**只做翻译不做优化**，给的是工艺无关网表，能讲清「组合逻辑怎么变成门」但讲不了映射、时序驱动优化、面积优化 —— 别拿它冒充综合器。"
+      "integration": "tools/synth.py --netlist（零下载：iverilog -t blif）；tools/synth.py --engine yosys 走完整综合与工艺映射（2026-09-29 接入，固定 pass 列表写死在 tools/_yosys.py 并原样进报告）。★ 它是**多加一条腿**、不是换掉 iverilog 那条：两条腿对同一份 RTL 的结论会不一样，报告里两侧都摆出来（designs[i].cross_check）",
+      "note": "L3-05 综合原理、L3-06 综合日志读解。装了 yosys 之后这两讲可以从「读样例」升级为「自己跑出来再读」。但要注意两点：(1) yosys 是开源综合器，报告格式和 DC/Genus 不同，读解训练仍以真实商业报告样例为主；(2) 零下载的 iverilog 那条路**只做翻译不做优化**，给的是工艺无关网表，能讲清「组合逻辑怎么变成门」但讲不了映射、时序驱动优化、面积优化 —— 别拿它冒充综合器。\n★ 2026-09-29 接入后的实测边界（改这条之前先看 tools/_yosys.py 的模块头）：(1) 固定 pass 列表 read_verilog → hierarchy -check → proc → opt → fsm → opt → techmap → opt → abc → opt → stat，**不同 pass 顺序给出的数字不可比**，所以列表写死并原样进报告；(2) **「退出码 0」和「有输出」都不是跑过的证据**：空文件 rc=0、日志正常、但一个模块都没有（缺 DLL 时更是 rc=0 且零字节），硬判据取 stat 块存在；(3) 它**不再**受 iverilog blif 那个异步复位限制 —— fsm_bin.v 这类设计在 yosys 上照常出数字，报告会用 yosys_handles_it 归类，措辞上明说「你的 RTL 没问题」。"
     },
     {
       "id": "synth.netlist.iverilog",
@@ -637,10 +644,10 @@
       "requires": [
         "yosys"
       ],
-      "gap": "software",
+      "gap": "software+code",
       "impact": "shrinks",
       "fallback": "只能定性讲「关键路径大概在哪」",
-      "integration": "（仓库有活干，但**卡口是 yosys 不是代码**：装了才值得写）",
+      "integration": "（**代码这边还没写完**：tools/_yosys.py 的定位 / 运行 / 解析 / 失败归类2026-09-29 已立起来（合成那条腿在用），但本项要的 `abc -liberty` 延时估算**还没接**，而且本仓库没有工艺库文件，接上了也不是签核级数字。2026-09-29 之前这里写的是 `software`，那是个谎——OSS 套件一装，evaluate() 就把本项判成可用，而这段文字自己写着「仓库有活干」。装着软件 ≠ 跑得起来。）",
       "note": "yosys 配 abc -liberty 能按延时约束做映射优化，给出的是**估算**而非签核级 STA——算不出 slack、枚举不了路径。这是 sta.slack 不可用时的部分替代，不要把它当成 STA 讲。"
     },
     {
@@ -652,10 +659,10 @@
       "requires": [
         "verible"
       ],
-      "gap": "software",
+      "gap": "software+code",
       "impact": "shrinks",
       "fallback": "用规范清单人工审查（L3-04 大纲本来就这么写的）",
-      "integration": "（仓库有活干，但**卡口是 verible 不是代码**：装了才值得写）",
+      "integration": "（**代码这边还没写**：要调 `verible-verilog-lint` 并解析 `文件:行:列: 消息 [规则名]`。2026-09-29 之前这里写的是 `software`，那是个谎——verible 一装本项就报可用，而没有任何调用点。规则集也得挑：实测 `--ruleset=all` 出来的头两类是 `module-filename` / `port-name-suffix`，是 Google 内部约定、不是通用规范，直接放给学习者就是噪声。）",
       "note": "L3-04 RTL 编码规范、L3-33 代码评审能用上——把「规范」从文档变成可自动检查的规则。低优先级，verilator 的 lint.full 覆盖不了风格类规则。"
     },
     {
@@ -683,10 +690,10 @@
         "formal",
         "z3"
       ],
-      "gap": "software",
+      "gap": "software+code",
       "impact": "shrinks",
       "fallback": "人工审查 + 自写结构性检查脚本",
-      "integration": "（仓库有活干，但**卡口是 sby/z3 不是代码**：装了才值得写）",
+      "integration": "（**代码这边还没写**：要写 `.sby` 作业文件、调 `sby`、解析 k-induction 的 pass/fail。2026-09-29 之前这里写的是 `software`，那是个谎——sby/z3 随 OSS 套件装好之后本项就报可用，而 integration 里明明写着有活干。）",
       "note": "这是 CDC 唯一「能真跑」的替代路径：用 sby 证明同步器性质（两级同步器不传播亚稳态、格雷码指针每次只变一位）。要手写属性，但写出来就是真的验证过。比「讲原理」强，值得补进 L3-12。"
     },
     {
@@ -714,10 +721,10 @@
         "formal",
         "z3"
       ],
-      "gap": "software",
+      "gap": "software+code",
       "impact": "shrinks",
       "fallback": "只能讲概念",
-      "integration": "（仓库有活干，但**卡口是 sby/z3 不是代码**：装了才值得写）",
+      "integration": "（**代码这边还没写**：要写 `.sby` 作业文件、调 `sby`、解析 k-induction 的 pass/fail。2026-09-29 之前这里写的是 `software`，那是个谎——sby/z3 随 OSS 套件装好之后本项就报可用，而 integration 里明明写着有活干。）",
       "note": "sby(13.5MB) + z3(18.4MB) = 约 32 MB 就能从「只能讲」变成能动手。套件自带求解器是它相对自行搭建的最大优势。"
     },
     {
@@ -731,10 +738,10 @@
         "formal",
         "z3"
       ],
-      "gap": "software",
+      "gap": "software+code",
       "impact": "shrinks",
       "fallback": "只能讲概念",
-      "integration": "（仓库有活干，但**卡口是 eqy/formal/z3 不是代码**：装了才值得写）",
+      "integration": "（**代码这边还没写**：要写划分脚本、给 eqy 提供 gold/gate 两侧、解析等价性结论。2026-09-29 之前这里写的是 `software`，那是个谎——eqy 随套件装好之后本项就报可用。）",
       "note": "L3-15。eqy 只有 1.4 MB，配合已下的 formal + z3 就能做「RTL vs 综合后网表」的等价性检查，正好补上综合那块的闭环。"
     },
     {
@@ -747,10 +754,10 @@
         "verilator",
         "mingw"
       ],
-      "gap": "software",
+      "gap": "software+code",
       "impact": "degrades",
       "fallback": "只能讲概念 + 手工统计（功能覆盖率的合并见 cov.func，那条已经能跑了）",
-      "integration": "（仓库有活干，但**卡口是 verilator+mingw 不是代码**：装了才值得写）",
+      "integration": "（**两边都缺**：软件要装 verilator + mingw，装完本仓库还得写覆盖率接入代码。2026-09-29 之前这里写的是 `software`，那是个谎——mingw 一装，evaluate() 就会把本项判成可用，而 integration 里明写着「仓库有活干」。两个状态挤进一个字段，报告就没法诚实。）",
       "note": "iverilog 没有任何覆盖率功能（-h 里无相关 flag，已实测）。verilator 提供 line / toggle / user 三类覆盖率和 verilator_coverage 报告工具。注意没有 IEEE 语义的 covergroup/coverpoint 功能覆盖率。⚠ 覆盖率属于 verilator 的「编译出仿真模型」那条路，需要 C++ 编译器 + make。所以这里 requires 两项**不是凑数**：只装 verilator 的话本项仍然缺着，会误报「装了就好」。"
     },
     {

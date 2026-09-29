@@ -37,6 +37,20 @@ PROBE_TIMEOUT = 20
 
 # 影响级别的展示顺序与图标。顺序 = 严重程度递减。
 IMPACT_ORDER = ["blocks", "degrades", "shrinks", "talk_only"]
+
+# 一条能力「缺什么」。
+#   none          不缺，本仓库已实现且可用
+#   software      缺软件，装上就好
+#   code          缺本仓库的代码，装什么都没用
+#   software+code **两边都缺**：软件要装，装完本仓库还得补接入代码
+#
+# ★ 为什么非要第四种：`software+code` 出现之前，这种情况只能二选一，而两个
+#   选项都会骗人——写 `software` 会让使用者以为装完就齐了（mingw 一装，
+#   `cov.code` 就被 evaluate() 判成可用，**而它的 integration 明说「仓库有活干」**）；
+#   写 `code` 又会说成「装什么都没用」，可软件确实是卡口之一。这与
+#   lint.ran / n_warnings=0、found / usable 是同一条教训：**两个不同的状态
+#   挤进一个字段，报告就没法诚实。**
+GAP_VALUES = ("none", "software", "code", "software+code")
 IMPACT_ICON = {
     "blocks": "🔴",
     "degrades": "🟠",
@@ -107,12 +121,23 @@ class Capability:
     name: str
     levels: list[str]
     requires: list[str]
-    gap: str  # none | software | code
+    gap: str  # 取值见 GAP_VALUES
     impact: str
     fallback: str | None
     integration: str | None
     note: str
     raw: dict
+
+    @property
+    def needs_code(self) -> bool:
+        """这条能力是不是还缺**本仓库自己**的代码。
+
+        两种 gap 都算：`code`（只缺代码）和 `software+code`（软件和代码都缺）。
+        它决定 evaluate() 里「装了软件也不许判 ok」——
+        **caveat 只是给人看的，判定必须自己知道这件事**，
+        否则清单会出现「一边报可用、一边打印说不可用」的自相矛盾。
+        """
+        return self.gap in ("code", "software+code")
 
     def as_dict(self) -> dict:
         return {
@@ -246,8 +271,15 @@ def validate(m: Manifest) -> list[str]:
         seen_cap.add(c.id)
         if c.impact not in IMPACT_ORDER:
             problems.append(f"capability {c.id} 的 impact 值未知：{c.impact!r}")
-        if c.gap not in ("none", "software", "code"):
+        if c.gap not in GAP_VALUES:
             problems.append(f"capability {c.id} 的 gap 值未知：{c.gap!r}")
+        # gap 说「缺软件」时，requires 就必须真的列着东西——
+        # 列不出来说明这条的缺法没说清，使用者照着报告一条都装不上。
+        if c.gap in ("software", "software+code") and not c.requires:
+            problems.append(
+                f"capability {c.id} 的 gap 是 {c.gap!r}，但 requires 是空的——"
+                f"没有可装的软件，这句「缺软件」落不了地"
+            )
         for sid in c.requires:
             if sid not in sw_ids:
                 problems.append(f"capability {c.id} 引用了不存在的 software：{sid}")
@@ -553,7 +585,8 @@ class CapabilityStatus:
     cap: Capability
     ok: bool
     missing_software: list[str] = field(default_factory=list)
-    # ok=False 且 gap=="code" 时为 True：不是缺软件，是缺实现
+    # ok=False 时：还缺本仓库自己的代码（gap 为 code 或 software+code）。
+    # 单看这一位分不出「只缺代码」和「代码软件都缺」——要配合 software_gap。
     code_gap: bool = False
     # 缺失的软件里，Windows 原生装不了的那些（wsl-only / unavailable）。
     # 单独拎出来是因为它们**不能**和普通缺失混在一句「装上这些就行」里报告——
@@ -566,9 +599,26 @@ class CapabilityStatus:
         return [sid for sid in self.missing_software if sid not in self.unavailable_software]
 
     @property
+    def software_gap(self) -> bool:
+        """还缺软件。"""
+        return bool(self.missing_software)
+
+    @property
+    def both_gaps(self) -> bool:
+        """软件和本仓库的代码**两边都缺**。
+
+        必须单独一位，不能从 code_gap 推：`code_gap` 对「只缺代码」和
+        「两边都缺」都是 True，而这两句话给使用者的下一步完全相反——
+        前者「等仓库补，装什么都没用」，后者「可以先装起来，但装完还不齐」。
+        挤成一个布尔，报告就只能说其中一句，另一句就成了谎。
+        """
+        return self.code_gap and self.software_gap
+
+    @property
     def actionable(self) -> bool:
-        """装软件能不能解决。code gap 装什么都没用；
-        缺失软件全是 Windows 原生装不了的，也算「装了也解决不了」。"""
+        """**光装软件**能不能解决。code 缺口装什么都没用；
+        两边都缺的也算「装了也解决不了」——装完还有代码要等。
+        缺失软件全是 Windows 原生装不了的，同样算解决不了。"""
         return (not self.ok) and (not self.code_gap) and bool(self.installable_missing)
 
 
@@ -599,17 +649,18 @@ def evaluate(m: Manifest, probes: dict[str, ProbeResult]) -> list[CapabilityStat
             if not _satisfied(probes.get(sid, ProbeResult(sid, False)))
         ]
 
-        # gap == "code" 表示「这个能力本仓库还没实现，缺的是代码不是软件」。
-        # 这类能力通常 requires 为空，如果只看依赖是否满足就会被判成 ok=True——
-        # 于是「多参数批量回归」这种压根没写的功能会显示「可用」。
-        # 必须显式排除，否则整个检查会谎报。
-        ok = (not missing) and c.gap != "code"
+        # gap 带 code 的（"code" / "software+code"）表示「本仓库还没实现」。
+        # 这类能力如果只看依赖是否满足就会被判成 ok=True——于是「多参数批量回归」
+        # 这种压根没写的功能会显示「可用」；而 `software+code` 更隐蔽：
+        # 它 requires 列着真软件，装上就「齐了」，可 integration 里明明写着
+        # 「仓库有活干」。**必须显式排除，否则整个检查会谎报。**
+        ok = (not missing) and (not c.needs_code)
         out.append(
             CapabilityStatus(
                 cap=c,
                 ok=ok,
                 missing_software=missing,
-                code_gap=(not ok) and c.gap == "code",
+                code_gap=(not ok) and c.needs_code,
                 unavailable_software=[sid for sid in missing if _native_unavailable(m, sid)],
             )
         )
@@ -659,6 +710,8 @@ def summarize_for_level(
                 **s.cap.as_dict(),
                 "missing_software": s.missing_software,
                 "code_gap": s.code_gap,
+                "software_gap": s.software_gap,
+                "both_gaps": s.both_gaps,
                 "installable_missing": s.installable_missing,
                 "unavailable_software": s.unavailable_software,
                 "actionable": s.actionable,

@@ -7,6 +7,34 @@
 **这里综合的是待测模块，不是测试台。** 合测试台必定失败（`$display`、
 `#delay`、`initial` 都合不出来），所以不要像 sim.py 那样把 tb 传进来。
 
+## `--engine yosys`：真综合（优化 + 工艺映射 + 让综合器自己挑编码）
+
+    python tools/synth.py fsm.v --engine yosys                    # 真综合
+    python tools/synth.py fsm.v --engine yosys --fsm-encoding binary
+    python tools/synth.py fsm.v --engine yosys --encoding-compare # 三种编码对比
+
+默认引擎仍是 `iverilog`，**行为一个字节都没变**。`--engine yosys` 是**多加一条腿**，
+不是换掉原来那条 —— iverilog 那条照跑，两条腿的结果并列报出来。这不是为了好看：
+两条腿**对同一份 RTL 的结论会不一样**，而那个分歧本身就是教学材料（见下）。
+
+`--encoding-compare` 对同一份设计依次跑 `auto / one-hot / binary` 并出对比表。
+★ 表里**必须**带「状态机有没有被认出来」：认不出来时三种编码的数字相同，
+但那不是"编码没影响"，是"压根没比较到东西"（`_yosys.compare_encodings` 里
+`comparable` / `identical` 是分开的两位，就是这个原因）。
+
+### yosys 那条腿自己特有的沉默失败（都是实测）
+
+1. **非硬件 cell 会活到 `abc` 之后，退出码还是 0。** `synth_unsynth.v`
+   （含 `$display`/`#2`）跑完整条流水线 → rc=0、96 cells、里面有 `$print`。
+   直接报「96 个门」就是假话，所以 `gate_count_meaningful` 会翻 false，
+   门数照旧打印但**明确标注不可当结论**。而同一份文件在 iverilog 那条腿上
+   判 `not_synthesizable` —— **这就是两条腿的分歧，两边都得摆出来。**
+2. **`#延迟` 被静默丢弃**，日志里一句警告都没有（`$monitor` 反而会记一笔）。
+3. **空文件 rc=0、日志正常，但一个模块都没有。** 所以「退出码 0」和
+   「有输出」都不能当跑过的证据，硬判据取 stat 块存在。
+4. **`fsm_recode` 只有 `one-hot` 和 `binary`** —— 没有 gray / johnson。
+   课程讲的三种编码，综合器只能替你挑两种。
+
 ## 先说清楚它不是什么（这一段比用法重要）
 
 iverilog 不是综合器，`-t sizer` / `-t blif` 是它自带的**结构提取**后端：
@@ -72,6 +100,7 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
+import _yosys  # noqa: E402
 from _console import init_console  # noqa: E402
 from _proc import run as run_proc  # noqa: E402
 from _toolchain import detect, repo_root  # noqa: E402
@@ -119,6 +148,66 @@ _LIMITS = [
     "它不知道哪些跳变是热的。那半只有仿真知道，见 tools/toggle.py（零下载）："
     "同一台 4 位计数器、同一套激励，二进制 34 次变化翻 63 位，格雷 34 次翻 34 位。",
 ]
+
+# yosys 那条腿的边界。**和 _LIMITS 分开报**：这些说法对 iverilog 的 sizer 不成立，
+# 混在一起读者就分不清哪句在说哪条腿。
+_YOSYS_LIMITS = [
+    "真做了优化（opt）和工艺映射（techmap + abc），所以数字比 iverilog 的 sizer "
+    "可信得多 —— 但仍**不是真实面积**：abc 用的是内置的通用映射（`$_AND_` / "
+    "`$_DFF_*` 这些内部门），不是某个 FPGA 或某个工艺的 LUT / 标准单元。"
+    "要真实面积得上 `abc -liberty` 加工艺库文件，**本仓库没有工艺库，也不打算假装有**。",
+    "固定 pass 列表：read_verilog → hierarchy -check → proc → opt → fsm → opt → "
+    "techmap → opt → abc → opt → stat。**不同 pass 顺序给出的数字不可比**，"
+    "所以这个列表写死在 `_yosys.PIPELINE_STAGES` 里并原样进 JSON 报告 —— "
+    "报告里只有数字没有流程，读者没法判断两份报告能不能放在一起看。",
+    "**`fsm_recode` 只支持 `one-hot` 和 `binary`。** 没有 gray / johnson："
+    "课程里讲的三种编码，综合器能替你挑的只有两种，格雷必须自己在 RTL 里写。",
+    "★ 本项**不改变任何判定**。综合产物回答的是「这么写合成出多少硬件」，"
+    "对错仍然只由 sim.py 说了算。",
+]
+
+
+def _cross_check(leg: dict, y: dict) -> dict | None:
+    """把 iverilog 那条腿和 yosys 那条腿的结论摆在一起，**分歧要挑明**。
+
+    两份独立证据打架，不是"谁对谁错"——但**绝不能只把乐观的那一个报给学习者**。
+    这是本仓库特有的机会：同一个工具链里跑着两套综合后端，正好互相照出边界。
+    """
+    kind = _err_of(leg).get("kind")
+    if not y.get("ran"):
+        return None
+
+    if kind == "async_reset_unsupported":
+        # ★ 这不是分歧，是**预料之中的**：异步复位在 yosys 里是标准写法，
+        #   只有 iverilog 的 blif 后端没实现。说明白，别让学习者以为
+        #   "两个工具打架了，不知道信谁"。
+        return {
+            "kind": "yosys_handles_it",
+            "message_zh": (
+                "iverilog 的 blif 后端吃不了异步复位，**yosys 吃得下** —— "
+                f"它给出了 {y.get('n_cells')} 个门 / "
+                f"{y.get('n_state_bits')} 位寄存器。"
+                "这不是「两边打架」，是二者的能力边界不同：异步复位在 "
+                "yosys / Vivado / DC 里都是标准写法，**你的 RTL 没问题**。"
+            ),
+        }
+
+    if kind in ("not_synthesizable", "iverilog_crash"):
+        return {
+            "kind": "disagreement",
+            "message_zh": (
+                "★ **两条腿的结论不一致，两个都要看。** iverilog 说这份设计"
+                f"合不了（{kind}），而 yosys 照常跑完并给出了数字。"
+                "常见成因有两个，都在 `_yosys.py` 的模块头里写明了："
+                "① 设计里有 `$display` / `initial` 这类仿真专用的东西 —— "
+                "yosys **不会因此拒绝**，它把它们当成非硬件 cell 留在网表里，"
+                "退出码照样是 0，于是那个「门数」其实是一堆不是硬件的东西的个数；"
+                "② `#延迟` 被 yosys **静默丢弃**，日志里一句警告都没有。"
+                "**看 yosys 这一侧的 `gate_count_meaningful`**：它是 false 就说明"
+                "上面那个数字不能当门数用。"
+            ),
+        }
+    return None
 
 
 # ---------------------------------------------------------------- sizer 解析
@@ -502,6 +591,47 @@ def synth_one(tc, src: Path, root: Path, workdir: Path, top: str | None,
     return res
 
 
+# ---------------------------------------------------------------- yosys 一次综合
+
+
+def yosys_one(src: Path, workdir: Path, top: str | None, encoding: str,
+              defines: list[str], includes: list[str], sv: bool,
+              timeout: float) -> dict:
+    """对**一个**源文件跑一次 yosys 真综合。失败**不抛异常**，如实报。"""
+    workdir.mkdir(parents=True, exist_ok=True)
+    y = _yosys.run(
+        [src], top=top, encoding=encoding, sv=sv, defines=defines,
+        includes=includes, workdir=workdir, timeout=timeout,
+    )
+    out = y.as_dict()
+    out["file"] = src.as_posix()
+    out["workdir"] = workdir.as_posix()
+    return out
+
+
+def yosys_compare(src: Path, workdir: Path, top: str | None,
+                  defines: list[str], includes: list[str], sv: bool,
+                  timeout: float) -> dict:
+    """同一份设计跑 `auto / one-hot / binary` 三遍并出对比。
+
+    每一次**各用一个子目录**：stat 文件同名，共用一个目录会互相覆盖，
+    于是三次读到的可能是同一次的结果（叠加在一起就是"三种编码数字全同"，
+    看着正好像一个像模像样的结论 —— 静默错答案的典型形状）。
+    """
+    runs: dict[str, _yosys.YosysResult] = {}
+    per: dict[str, dict] = {}
+    for enc in _yosys.ENCODINGS:
+        r = _yosys.run(
+            [src], top=top, encoding=enc, sv=sv, defines=defines,
+            includes=includes, workdir=workdir / enc, timeout=timeout,
+        )
+        runs[enc] = r
+        per[enc] = r.as_dict()
+    cmp_ = _yosys.compare_encodings(runs)
+    cmp_["runs"] = per
+    return cmp_
+
+
 # ---------------------------------------------------------------- 输出
 
 
@@ -574,8 +704,85 @@ def _print_summary(rep: dict) -> None:
         n_nl = sum(1 for d in rep["designs"] if d.get("netlist"))
         w(f"网表（--netlist）：{n_nl}/{len(rep['designs'])} 份产出"
           f"{'' if n_nl == len(rep['designs']) else '  ← 你要了网表，这几份没给出来'}\n")
+
+    if rep.get("engine") == "yosys":
+        _print_yosys(rep)
+
     w(f"结果：{'全部成功 ✓' if rep['ok'] else '有未完成项 ✗'}\n")
     w("=" * 60 + "\n")
+
+
+def _print_yosys(rep: dict) -> None:
+    """yosys 那条腿的摘要。**和 iverilog 那一段分开印**，两条腿的数字不混。"""
+    w = sys.stderr.write
+    ds = rep["designs"]
+    w("\n" + "-" * 60 + "\n")
+    w("yosys 真综合（opt + techmap + abc；仍不是真实面积，没有工艺库）\n")
+    w(f"  编码：{rep['yosys']['encoding']}"
+      f"（支持 {'/'.join(rep['yosys']['encodings_supported'])}，"
+      f"**没有 gray**）\n")
+    w(f"  {'文件':<22}{'门':>6}{'寄存器位':>9}  {'顶层':<14}{'状态机':<8}{'门数可用'}\n")
+    w("  （`(N)` = 不是门数：这次的结果里混着非硬件 cell 或没映射的 cell）\n")
+
+    for d in ds:
+        y = d.get("yosys") or {}
+        name = Path(d["file"]).name
+        if not y.get("ran"):
+            w(f"  {name:<22}{'—':>6}{'—':>9}  "
+              f"{(y.get('skipped_reason_zh') or '没跑成')[:40]}\n")
+            continue
+        top = (y.get("modules") or [{}])[0].get("name") or "?"
+        # ★ 门数这一列，只有 gate_count_meaningful 时才当数字印。
+        #   否则印出来再加一个明确的"不可用"标记 —— 数字照给（它是事实），
+        #   但绝不让它看起来像一个结论。
+        n_cells = y.get("modules") and y["modules"][0]["counts"].get("cells")
+        if n_cells is None:
+            nc = "—"
+        elif y.get("gate_count_meaningful"):
+            nc = str(n_cells)
+        else:
+            # ★ 数字照给（它是事实），但**加括号** —— 括号里那个不是门数，
+            #   是非硬件 cell / 未映射 cell 混在一起的个数。
+            #   不加标记干印一个 96，读者就会把它当"这个设计 96 个门"。
+            nc = f"({n_cells})"
+        usable = "✓" if y.get("gate_count_meaningful") else "✗ 见下"
+        w(f"  {name:<22}{nc:>6}{str(y.get('modules', [{}])[0].get('n_state_bits', '—')):>9}  "
+          f"{top:<14}{('认出' if y.get('fsm_detected') else '无'):<8}{usable}\n")
+        if y.get("encoding_used"):
+            w(f"      yosys 实际用的编码：{y['encoding_used']}\n")
+
+    for d in ds:
+        y = d.get("yosys") or {}
+        name = Path(d["file"]).name
+        for n in (y.get("notes_zh") or []):
+            w(f"  ! {name}：{n}\n")
+        cc = d.get("cross_check")
+        if cc:
+            w(f"\n  ⇄ {name} 两条腿：{cc['message_zh']}\n")
+        for wn in (y.get("warnings") or [])[:5]:
+            w(f"  ⚠ {name} yosys 警告：{wn}\n")
+
+    want = rep.get("wanted_encoding_compare")
+    if want:
+        w("\n" + "-" * 60 + "\n")
+        w("状态编码对比（auto / one-hot / binary）\n")
+        for d in ds:
+            c = d.get("encoding_compare") or {}
+            name = Path(d["file"]).name
+            if not c.get("comparable"):
+                w(f"  ✗ {name}：本次**没能比较**（设计里没认出状态机）——"
+                  f"三次数字相同不是结论。\n")
+                continue
+            w(f"  {name}：\n")
+            w(f"      {'编码':<10}{'寄存器位':>9}{'门':>6}   {'yosys 实际用的'}\n")
+            for r in c["rows"]:
+                bits = "—" if r["n_state_bits"] is None else r["n_state_bits"]
+                cells = "—" if r["n_cells"] is None else r["n_cells"]
+                w(f"      {r['encoding']:<10}{str(bits):>9}{str(cells):>6}   "
+                  f"{r.get('encoding_used') or '—'}\n")
+            for n in (c.get("notes_zh") or []):
+                w(f"      ! {n}\n")
+    w(f"\nyosys 综合：{rep.get('n_yosys_ok')}/{len(ds)} 份拿到可用的门数\n")
 
 
 # ---------------------------------------------------------------- CLI
@@ -604,12 +811,56 @@ def main(argv: list[str] | None = None) -> int:
                     help="额外的 include 目录（可重复）")
     ap.add_argument("--netlist", action="store_true",
                     help="同时生成并解析 blif 网表（默认只做资源估算）")
+    ap.add_argument("--engine", choices=["iverilog", "yosys"], default="iverilog",
+                    help="综合引擎（默认 iverilog）。yosys 是**多加一条腿**："
+                         "iverilog 那条照跑，两条腿的结果并列报出来。yosys 缺席时如实报缺")
+    # ★ 刻意**不用 argparse 的 choices**：那会走 argparse 自己的报错（退出码 2），
+    #   只能打印一句 "invalid choice"。而 `gray` 是这里最可能被输入的值 ——
+    #   课程讲了三种编码，综合器只支持两种，**这条正是要说清楚的地方**。
+    #   自己校验才给得出那段解释，退出码也和本工具其它用法错误统一成 64。
+    ap.add_argument("--fsm-encoding", default="auto", metavar="{auto,one-hot,binary}",
+                    help="状态机编码（只对 --engine yosys 有效）。auto = 让 yosys 自己挑。"
+                         "★ 只有 one-hot / binary —— yosys 的 fsm_recode 不支持 gray")
+    ap.add_argument("--encoding-compare", action="store_true",
+                    help="对每份设计依次跑 auto/one-hot/binary 并出对比表"
+                         "（需要 --engine yosys）")
+    ap.add_argument("--yosys-sv", action="store_true",
+                    help="用 SystemVerilog 前端读文件（只对 --engine yosys 有效；"
+                         "iverilog 那条腿固定 -g2005，不受影响）")
     ap.add_argument("--workdir", type=Path, help="产物目录（默认 build/synth）")
-    ap.add_argument("--timeout", type=float, default=30.0)
+    ap.add_argument("--timeout", type=float, default=30.0,
+                    help="iverilog 那条腿的超时（秒）")
+    ap.add_argument("--yosys-timeout", type=float, default=180.0,
+                    help="yosys 那条腿的超时（秒）。它真做优化和映射，比 sizer 慢得多")
     ap.add_argument("--json", type=Path, help="把 JSON 结果同时写入该文件")
     ap.add_argument("--pretty", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
+
+    if args.encoding_compare and args.engine != "yosys":
+        # 不静默地把引擎换掉：`--encoding-compare` 是 iverilog 的 sizer **做不到**的事
+        # （它对编码差异完全不敏感），悄悄换引擎会让使用者以为刚才那条腿出了那张表。
+        print("--encoding-compare 需要 --engine yosys：iverilog 的 sizer 不做优化，"
+              "对「同宽度下换编码」完全不敏感，给不出一张有意义的表。"
+              "请加 --engine yosys。", file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.fsm_encoding != "auto" and args.engine != "yosys":
+        print("--fsm-encoding 需要 --engine yosys（iverilog 那边没有状态机重编码这一说）。",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    if args.fsm_encoding not in _yosys.ENCODINGS:
+        # 这条要**单独说**，不能并进上面那句"需要 --engine yosys"：
+        # 它的错因完全不同（值本身不存在），而 `gray` 恰恰是课程讲过、
+        # 学习者最可能照着填进来的那个。
+        print(f"--fsm-encoding 只支持 {' / '.join(_yosys.ENCODINGS)}，"
+              f"给的是 {args.fsm_encoding!r}。"
+              f"★ **没有 gray（也没有 johnson）**：yosys 的 fsm_recode 不支持灰度编码。"
+              f"课程里讲三种编码，综合器能替你挑的只有两种 —— "
+              f"格雷要自己在 RTL 里写（把状态值直接写成格雷码即可）。",
+              file=sys.stderr)
+        return EXIT_USAGE
 
     if not args.designs:
         ap.print_help()
@@ -648,6 +899,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit(rep, args)
         return EXIT_ENV
 
+    use_yosys = args.engine == "yosys"
     workdir = args.workdir or (root / "build" / "synth")
     designs: list[dict] = []
     for src in args.designs:
@@ -657,20 +909,51 @@ def main(argv: list[str] | None = None) -> int:
         n = sum(1 for d in designs if Path(d["file"]).stem == src.stem)
         if n:
             sub = workdir / f"{src.stem}_{n}"
-        designs.append(synth_one(
+        d = synth_one(
             tc, src, root, sub, args.top, args.param, args.define, args.include,
-            args.netlist, args.timeout))
+            args.netlist, args.timeout)
+        if use_yosys:
+            # **多一条腿，不是换一条腿。** iverilog 那条照跑：
+            # 两条腿对同一份 RTL 的结论会不一样，那个分歧本身就是教学材料。
+            d["yosys"] = yosys_one(
+                src, sub / "yosys", args.top, args.fsm_encoding,
+                args.define, args.include, args.yosys_sv, args.yosys_timeout)
+            d["cross_check"] = _cross_check(d, d["yosys"])
+            if args.encoding_compare:
+                d["encoding_compare"] = yosys_compare(
+                    src, sub / "yosys-enc", args.top,
+                    args.define, args.include, args.yosys_sv, args.yosys_timeout)
+        designs.append(d)
 
-    # 两个计数必须分开报：`n_ok` 是**整体**成没成，`n_sizer_ok` 是 sizer 那条腿
-    # 单独成没成。和 lint.ran / lint.n_warnings 是同一条教训 ——
-    # 只报一个数，"资源估算拿到了但网表没出来"就无处表达。
+    # ★ 三个计数必须分开报，各有各的腿：
+    #     n_ok        iverilog 那条腿整体成没成（**含义不变**，默认引擎下它仍是唯一结论）
+    #     n_sizer_ok  sizer 单独成没成（网表挂了它照样有数字）
+    #     n_yosys_ok  yosys 单独成没成
+    #   和 lint.ran / lint.n_warnings 是同一条教训 —— 只报一个数，
+    #   "iverilog 那条腿成了、yosys 这条腿没成"就无处表达。
     n_ok = sum(1 for d in designs if d.get("ok"))
     n_sizer_ok = sum(1 for d in designs if d.get("totals"))
+    n_yosys_ok = sum(1 for d in designs
+                     if (d.get("yosys") or {}).get("ok")) if use_yosys else 0
+    # 用户显式要了编码对比、却一份都没比成 → 整体翻失败。
+    # 沿用 `--netlist` 那条先例：**要了东西没拿到，还报 pass 就是"跑绿了但你要的不在"**。
+    n_comparable = sum(1 for d in designs
+                       if (d.get("encoding_compare") or {}).get("comparable"))
+    want_compare = bool(use_yosys and args.encoding_compare)
+
+    ok = n_ok == len(designs)
+    if use_yosys:
+        ok = ok and n_yosys_ok == len(designs)
+    if want_compare:
+        ok = ok and n_comparable == len(designs)
+
     rep = {
         "schema": SCHEMA,
-        "ok": n_ok == len(designs),
-        "status": "pass" if n_ok == len(designs) else "fail",
-        "handler": "synth.py（iverilog -t sizer / -t blif）",
+        "ok": ok,
+        "status": "pass" if ok else "fail",
+        "handler": ("synth.py（iverilog -t sizer / -t blif + yosys 真综合）"
+                    if use_yosys else "synth.py（iverilog -t sizer / -t blif）"),
+        "engine": args.engine,
         "tool": {
             "exe": str(tc.iverilog),
             "gflag": GFLAG,
@@ -687,6 +970,25 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "next_actions_zh": _next_actions(designs),
     }
+    if use_yosys:
+        rep.update({
+            "n_yosys_ok": n_yosys_ok,
+            "yosys_limits_zh": list(_YOSYS_LIMITS),
+            "yosys": {
+                "exe": str(_yosys.locate() or ""),
+                "encoding": args.fsm_encoding,
+                "encodings_supported": list(_yosys.ENCODINGS),
+                "pipeline": list(_yosys.PIPELINE_STAGES),
+            },
+        })
+        # ★ 这里**不给**一份"本次用的脚本"：每份设计各跑一次 yosys，
+        #   脚本里的文件名和顶层各不相同，报一份代表性的等于报了一个
+        #   谁都没跑过的命令。真正的脚本在每份设计的 `designs[i].yosys.command` 里。
+    if want_compare:
+        rep.update({
+            "wanted_encoding_compare": True,
+            "n_comparable": n_comparable,
+        })
     _emit(rep, args)
     return EXIT_OK if rep["ok"] else EXIT_FAIL
 
@@ -700,6 +1002,7 @@ def _err_of(d: dict) -> dict:
 def _next_actions(designs: list[dict]) -> list[str]:
     out: list[str] = []
     kinds = {_err_of(d).get("kind") for d in designs if not d.get("ok")}
+
     if "iverilog_crash" in kinds:
         out.append("iverilog 断言崩溃：先去补全那个组合 always 的分支"
                    "（它推断出了锁存器），再看 sim.py 里的 lint 块。")
@@ -707,14 +1010,48 @@ def _next_actions(designs: list[dict]) -> list[str]:
         out.append("异步复位合不了**是 iverilog blif 后端的限制，不是写法错** —— "
                    "资源估算的数字照常可信。要出网表就得改用同步复位"
                    "（`always @(posedge clk)` + 里层 `if (!rst_n)`），"
-                   "或者装 yosys（它能吃异步复位）。别为了出网表把 RTL 改坏。")
+                   "或者用 --engine yosys（它能吃异步复位）。"
+                   "别为了出网表把 RTL 改坏。")
     if "not_synthesizable" in kinds:
         out.append("有构造合不了：#延迟 / initial 赋值 / 系统任务在硬件里"
                    "没有对应物，要挪出可综合的模块。")
     if {"no_top", "compile_error"} & kinds:
         out.append("前端就没过：先用 python tools/sim.py --syntax-only 看具体报错。")
+
+    # yosys 那条腿自己的下一步。**单独一段**：它成没成和 iverilog 那条腿成没成
+    # 是两件事，混进同一串「有构造合不了」里就分不清说的是哪条腿。
+    ys = [d["yosys"] for d in designs if d.get("yosys")]
+    if ys:
+        not_ran = [y for y in ys if not y.get("ran")]
+        if any("没找到 yosys" in (y.get("skipped_reason_zh") or "") for y in not_ran):
+            out.append("装 yosys：python tools/setup_tools.py --install yosys --lock"
+                       "（随 OSS CAD Suite 整包，572 MB）。")
+        elif not_ran:
+            out.append("yosys 这条腿有没跑成的：看 designs[i].yosys.skipped_reason_zh —— "
+                       "**「起了但没跑到 stat」和「压根没起来」是两回事**，"
+                       "成因和下一步完全不同。")
+        if any(y.get("non_hw_cells") for y in ys):
+            out.append("★ yosys 跑出了非硬件 cell（$print/$finish 一类）—— "
+                       "这次的「门数」不是门数，别拿它下结论。"
+                       "要把设计合出硬件，先把 $display / initial 挪出可综合的模块。")
+        if any(y.get("unmapped_cells") for y in ys):
+            out.append("有 cell 停在行为级没被映射成门（$mem 之类）："
+                       "那一部分不是门数。memory 上工艺要换成 BRAM/寄存器堆的写法再合。")
+        if any(d.get("cross_check") for d in designs):
+            out.append("★ 看每份设计的 `cross_check`：两条腿结论不一致时，"
+                       "报告里两侧都摆出来了 —— 别只看乐观的那一个。")
+
+    if any((d.get("encoding_compare") or {}).get("comparable") is False
+           for d in designs if d.get("encoding_compare")):
+        out.append("编码对比里有设计**没认出状态机**：三种编码数字相同不是结论。"
+                   "先确认这份设计里确实有状态机。")
+
     if not out and len(designs) > 1:
         out.append("横向比「门」这一列：这就是同一份功能不同写法的代价差。")
+    if not out and ys:
+        out.append("想试别的编码：`--fsm-encoding one-hot|binary`；"
+                   "想三种一起比：`--encoding-compare`。"
+                   "★ 没有 gray —— yosys 的 fsm_recode 不支持，格雷得自己写。")
     if not out:
         out.append("要出网表加 --netlist；要对比编码方式，把几份实现一起传进来。")
     return out

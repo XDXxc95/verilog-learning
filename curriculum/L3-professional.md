@@ -20,10 +20,10 @@
 |---|---|---|
 | RTL 功能设计 | ✅ 完整（iverilog 仿真 + 自动判定） | — |
 | 测试台与验证 | ✅ 完整（自检测试台、随机激励、覆盖率概念） | UVM 类库、商业仿真器特性；代码覆盖率需装 verilator |
-| 逻辑综合 | ⚠️ 装 **yosys** 能真综合、看门数、比状态编码（**已实测可用**，Yosys 0.69+154）；**零下载**的 iverilog `-t blif`（门级网表）/ `-t sizer`（FF 与门数估算）也能出真实数字 | ❌ 跑不了 DC / Genus，没有工艺库，面积/时序不是真实数字 |
+| 逻辑综合 | ✅ **零下载**的 iverilog `-t blif`（门级网表）/ `-t sizer`（FF 与门数估算）**已接入**（`tools/synth.py`）；✅ **yosys 也已接入**（`--engine yosys`，2026-09-29）——真跑 `proc → opt → fsm → techmap → abc`，出**映射后**的门数，并支持 `--encoding-compare` 让综合器自己挑状态编码（⚠️ 只支持 one-hot / binary，没有 gray） | ❌ 跑不了 DC / Genus，**没有工艺库**，面积/时序不是真实数字（`abc` 用的是内置通用映射，只能横向比） |
 | 静态时序分析 | ⚠️ 只能讲原理 + 手算 slack + 读真实报告样例 | ❌ **Windows 原生无方案**（OpenSTA 需 WSL2）。没有真实 slack |
-| Lint / CDC 检查 | ⚠️ 自带 `_lint.py` 只覆盖锁存器；装 **verilator** 可补真 lint（位宽/组合环/多驱动）；装 **verible** 可补编码规范检查 | ❌ CDC 没有成熟开源工具，只能人工审查 + 形式验证辅助 |
-| 形式验证 | ⚠️ 装 OSS CAD Suite 的 **sby / eqy / z3** 可做属性验证与等价性检查（**已实测可用**：sby + `smtbmc z3` 的 k-induction 作业跑出 `DONE (PASS, rc=0)`） | ❌ 规模和易用性远不如商业工具 |
+| Lint / CDC 检查 | ⚠️ 自带 `_lint.py` 只覆盖锁存器；**verilator 已接入**（`tools/_vlint.py`）可补真 lint（位宽/组合环/多驱动）；⚠️ **verible 装是装在（0.0-4296），但还没有调用它的代码**，编码规范检查**目前跑不了** | ❌ CDC 没有成熟开源工具，只能人工审查 + 形式验证辅助 |
+| 形式验证 | ⚠️ **sby / eqy / z3 已装好且手动跑得通**（实测 sby + `smtbmc z3` 的 k-induction 作业跑出 `DONE (PASS, rc=0)`），**但那是手敲命令行跑的、不是仓库跑的** —— `tools/` 里没有调用它们的入口，所以这一项**在仓库里跑不了** | ❌ 规模和易用性远不如商业工具 |
 | DFT / 低功耗 | ⚠️ 只能讲概念和接口 | ❌ **Windows 原生无方案**。且 L3-14 / L3-13 大纲本来就没承诺动手 |
 
 **装不装由你定，缺工具不阻塞开课。** 跑 `python tools/check_tools.py --level L3` 看这一级缺什么、缺了会怎样、装什么能补，然后 `python tools/setup_tools.py --install <id> --lock` 装到仓库里（不影响系统环境）。
@@ -34,14 +34,36 @@
 
 ⚠️ **OSS CAD Suite 只装整包，不要装分组件**（2026-09-28 实测的分组件，2026-09-29 被整包推翻）。分组件 Windows 资产**不自包含**：`windows-x64-yosys.tgz` 装完，`yosys.exe` 启动即 `STATUS_DLL_NOT_FOUND`——它要 `libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1` 一整组运行时 DLL，而组件里一个都不带。表现是**一个字节输出都没有、也没有报错信息**，只看「文件在不在」必然误判成装好了。
 
-根因不是"缺几个 DLL、补上就行"：整包与分组件带的 `libstdc++-6.dll` 存在 **C 库 ABI 分裂**（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），拿 bleyer iverilog 的同名 DLL 顶上只会把 `STATUS_DLL_NOT_FOUND (0xC0000135)` 换成 `STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)`，**不能混用**。所以清单里 7 个条目（yosys / verilator / sby / eqy / z3 / oss-utils / oss-system-resources）现在统一指向**同一个整包**，`setup_tools.py` 按 `(repo, tag, asset)` 判重，只下一次、只解一次。
+根因不是"缺几个 DLL、补上就行"：整包与分组件带的 `libstdc++-6.dll` 存在 **C 库 ABI 分裂**（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），拿 bleyer iverilog 的同名 DLL 顶上只会把 `STATUS_DLL_NOT_FOUND (0xC0000135)` 换成 `STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)`，**不能混用**。所以清单里 **8 个条目**（yosys / verilator / formal(sby) / eqy / z3 / slang / oss-utils / oss-system-resources）现在统一指向**同一个整包**，`setup_tools.py` 按 `(repo, tag, asset)` 判重，只下一次、只解一次。`verible` 不共这个整包，是 6.9 MB 的独立 zip，装到 `.tools/verible`。
 
 整包（572 MB）**已实测全部能用**：`yosys 0.69+154`、`verilator_bin 5.053`、`z3 4.15.5`、`sby` / `eqy` / `slang 11.0.448` / `gtkwave 4.0.0` 逐一起得来，形式验证真跑通了一个 k-induction 作业。代价是 `.tools/oss` 占 **2.1 GB**。`check_tools.py` 的判据是 `found and usable`（真跑一次功能自检），所以「文件在」不会被当成「能用」。
 
+⛔ **上面这些「实测可用」说的是软件起得来，不等于仓库跑得动。** 2026-09-29 更正：
+`yosys` / `sby` / `eqy` / `z3` 装好了，**但 `tools/` 里调用它们的代码一度一处都没有**——
+`sta.estimate`、`cdc.formal`、`formal.prop`、`formal.lec` 这四条能力因此标着
+`gap: "software+code"`（缺的是**接入代码**）。同理 `lint.style` 要的 verible 也装好了，
+缺的同样是接入代码。**现在的 L3 可用数是 6/19，不是 11/19**——那 5 条虚高是
+「软件一装就报可用、而 integration 里自己写着仓库有活干」造成的。
+要真正拿它们上课，得先按 `integration` 字段写接入代码。
+
+✅ **2026-09-29 接入的是另一块，这四条一条都没动**：`tools/_yosys.py` 立起来了
+（定位 / 运行 / `stat` 解析 / 失败归类 / 非硬件 cell 检测），**合成那条腿**
+（`synth.py --engine yosys`，对应 `synth.area` / `synth.encoding` / `synth.run` 三条）
+**已经能用它跑真东西**——那三条本来就标 `gap: "software"`（不装 yosys 也有零下载的
+`-t blif` / `-t sizer` 可走），本次是把 `integration` 里承诺的「让综合器自己挑编码」
+「真正做优化+映射后的面积」补成了真的。所以「`tools/` 里没有任何一处调用 yosys」
+这句**现在不成立**了。
+但**上面那四条 `software+code` 一条都没减少**：`sta.estimate` 要的是 `abc -liberty` 的
+延时估算（地基有了、那段没接，而且没有工艺库），`cdc.formal` / `formal.prop` /
+`formal.lec` 要的是 sby / eqy 作业脚本（**一行都还没写**）。**别把「yosys 接了一半」
+读成「形式验证也快了」**——它们共用的是定位和进程管理，作业划分是另一件事。
+
 **所以 L3 的教法会明确区分两类内容**：
 
-- **能动手验证的**：RTL 设计、功能验证、协议实现、CDC 的行为验证，以及装了工具之后的综合、lint、形式验证 → 照常在仓库里写代码跑判定
+- **能动手验证的**：RTL 设计、功能验证、协议实现、CDC 的行为验证 → 照常在仓库里写代码跑判定；综合与结构 lint 走 iverilog 自带的 `-t blif` / `-t sizer` 和 verilator 的 `--lint-only`（**都已接入**，零下载或装完即用）
 - **只能讲 + 读 + 手算的**：STA、DFT、低功耗、CDC 静态检查 → 讲清楚原理、给出真实报告样例读解、手算 slack，并在 `progress/notes/` 里留下笔记。**这些内容的检验方式是想明白、说清楚，不是跑通。**
+- **软件就位但仓库还没接入的**（暂按「讲」对待，接入后可升级为动手）：verible 驱动的编码规范检查、sby/eqy 驱动的形式验证、`abc -liberty` 驱动的延时估算 → **讲课前先确认接入代码写没写**，没写就说「这个还没接入，我讲原理 + 给你命令自己跑」，**不能说「仓库里跑通了」**
+  - ⚠️ **yosys 驱动的面积/编码对比已经不在这一档了**（2026-09-29 接入，见上）——别再把它列进「还没接入」里。反过来的风险更大：把已接入的说成没接入，学习者会去手敲命令行，而仓库里明明有条更稳的路
 
 **L3-18 的 SVA 已按实测改写**，不再指望装工具解决。可用的部分比想象中多，不能用的那部分也有确定的替代（实测结论）：
 
@@ -68,8 +90,8 @@
 | L3-02 | 规格书（Spec）怎么读、怎么问问题 | 读一份真实规格（UART/SPI），提取设计约束 |
 | L3-03 | 微架构设计：模块划分、接口定义、数据通路与控制通路 | 给自己的项目画微架构图 |
 | L3-04 | RTL 编码规范：命名、缩进、禁止项、可综合子集 | 用规范审查自己的旧代码 |
-| L3-05 | 逻辑综合原理：工艺库、约束驱动、面积/时序/功耗折衷 | 读真实综合报告，人工估算门数 |
-| L3-06 | 综合日志读解：警告分类、常见可修复问题 | 分析日志样例 |
+| L3-05 | 逻辑综合原理：工艺库、约束驱动、面积/时序/功耗折衷 | 读真实综合报告，人工估算门数；**并可自己跑一遍**：`python tools/synth.py <设计.v> --engine yosys` 看未映射 RTL 怎么一路变成 `$_AND_` / `$_DFF_*`（2026-09-29 接入） |
+| L3-06 | 综合日志读解：警告分类、常见可修复问题 | 分析日志样例；**并可自己造日志**：`tools/synth.py --engine yosys` 的 `warnings` / `errors` 已按「文件:行号 + 消息」解析出来。★ 反过来的一条同样要讲：**`#延迟` 被 yosys 静默丢弃、日志里一句警告都没有**（`$monitor` 反倒会警告）——「没报警告」不是「没问题」的证据 |
 | L3-07 | 时序约束基础：SDC（`create_clock` / `set_input_delay` / `set_false_path` / `set_multicycle_path`） | 为一个模块手写 SDC |
 | L3-08 | 静态时序分析：setup / hold、slack、关键路径、时钟域 | **手算** slack，判断违例原因 |
 | L3-09 | 时序违例怎么修：RTL 侧 vs 约束侧 | 给违例场景写修复方案 |

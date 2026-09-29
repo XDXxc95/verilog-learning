@@ -364,6 +364,15 @@ def _merge_into(src: Path, dst: Path) -> int:
 
     返回移动过去的条目数。
     """
+    # ★ dst 可能还不存在 —— **第一次**装某个独立包时就是这样
+    # （OSS 套件那几条走不到这里：`.tools/oss` 由先装的组件建出来了，
+    #  所以这个坑一直躲着没暴露）。不建的话下面第一句 shutil.move 就抛
+    # FileNotFoundError，而报错信息是「系统找不到指定的路径」，
+    # 完全指不到「目标目录没建」这件事上。
+    # 2026-09-29 装 verible 时实测踩到：文件全解压好了、锁也写了，
+    # 合并阶段一个都没搬出去，`.tools/verible` 根本没生成。
+    dst.mkdir(parents=True, exist_ok=True)
+
     moved = 0
     for item in list(src.iterdir()):
         target = dst / item.name

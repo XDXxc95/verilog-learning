@@ -85,7 +85,14 @@ def _print_level(manifest, level, probes) -> dict:
         icon = IMPACT_ICON.get(item["impact"], "?")
         label = IMPACT_LABEL.get(item["impact"], item["impact"])
         print(f"  {icon} {item['name']}   （{label}）", file=sys.stderr)
-        if item["code_gap"]:
+        if item["both_gaps"]:
+            # 软件和代码两边都缺。**不能只说其中一句**：
+            # 只报软件，使用者装完会以为齐了（而 integration 里写着「仓库有活干」）；
+            # 只报代码，又会说成「装什么都没用」，可软件确实是卡口之一。
+            names = ", ".join(item["missing_software"])
+            print(f"     这条**两个都缺**：软件要装（{names}），", file=sys.stderr)
+            print("     装完本仓库还得补接入代码 —— 只补一边都不算齐", file=sys.stderr)
+        elif item["code_gap"]:
             print("     缺的是代码不是软件 —— 装什么都没用，由本仓库自己补", file=sys.stderr)
         else:
             names = ", ".join(item["missing_software"])

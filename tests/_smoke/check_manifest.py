@@ -79,6 +79,43 @@ check(
     f"L1 不该有缺口，实测 {l1['capabilities_ok']}/{l1['capabilities_total']}",
     )
 
+# ------------------------------------------------- 真清单：integration 与 gap 不许自相矛盾
+#
+# 2026-09-29 实测出来的一个**系统性**谎报：有 5 条能力的 `integration` 里写着
+# 「仓库有活干，但**卡口是 X 不是代码**：装了才值得写」，而 `gap` 标的是
+# `software`。于是软件一装，`evaluate()` 就判它们可用——**而 integration
+# 自己承认还没有调用点**。L3 的可用数因此虚高到 11/19（实际 6/19）。
+#
+# 这条检查是**启发式**：它在 `integration` 的散文里找「还没实现」这类词，
+# 不是靠某个机器可读字段。之所以接受这个不精确，是因为 `gap` 已经就是那个
+# 字段了——错的是它的**取值**，不是缺一个字段。散文检查放在测试里当护栏，
+# 不进 `validate()`（那是给使用者看的硬校验，不该被措辞左右）。
+#
+# 它查不出什么：换一套说法（「待补」「TODO」）就漏了。**别把它当完备校验**，
+# 它只是把已经犯过的那一次钉住。加新能力时若 integration 里提到还没做的接入，
+# 就顺手也标 `gap: "software+code"`。
+_PENDING_CODE_WORDS = (
+    "仓库有活干",
+    "本仓库还未实现",
+    "本仓库还没实现",
+    "尚未实现",
+    "还没写",
+)
+_contradictions = []
+for _c in m.capabilities:
+    _it = _c.integration or ""
+    if any(w in _it for w in _PENDING_CODE_WORDS) and not _c.needs_code:
+        _contradictions.append(f"{_c.id}（gap={_c.gap}）")
+check(
+    _contradictions == [],
+    "integration 里承认「本仓库还没写接入代码」，gap 却没有 code —— "
+    f"软件一装就会被报成可用：{_contradictions}",
+    )
+
+# 反向也确认一次：标了 code 的，integration 得说得出缺什么，不能空着糊弄
+_vague = [c.id for c in m.capabilities if c.needs_code and len(c.integration or "") < 20]
+check(_vague == [], f"标了缺代码，integration 却没说缺什么：{_vague}")
+
 # ---------------------------------------------------------------- 负例 1：坏 JSON
 with tempfile.TemporaryDirectory() as td:
     tmp = Path(td)
@@ -305,6 +342,111 @@ with tempfile.TemporaryDirectory() as td:
     )
     s2 = M.summarize_for_level(mm2, "L2", p2)
     check(s2["missing_software"] == [], "代码缺口不该产生「需要装什么」的建议")
+
+    # ------------------------------------------ 负例 8a：软件和代码**两边都缺**
+    #
+    # 病根（2026-09-29 在真清单上抓到，就是 cov.code 那条）：`gap` 原先只有
+    # software / code 两种取值，而这种「装了软件还得补代码」的情况只能二选一，
+    # **两个选项都会骗人**：
+    #   写 software → mingw 一装 evaluate() 就判本项可用，而 integration 里
+    #                 明写着「仓库有活干」；
+    #   写 code     → 又说成「装什么都没用」，可软件确实是卡口之一。
+    #
+    # 最要命的是这个谎**延迟到装上软件那一刻才发作**——在那之前报告看着一切正常。
+    # 所以下面同时验「装之前」和「装之后」两个状态，只看一个会漏掉它。
+    mm3 = M.load(
+        _write(
+            tmp,
+            _minimal(
+                software=[
+                    {
+                        "id": "ghost2",
+                        "name": "又不存在的工具",
+                        "windows": "native",
+                        "check": {"exe": "zznonexistenttool_9f3a"},
+                        "provides": ["cap.both"],
+                    }
+                ],
+                capabilities=[
+                    {
+                        "id": "cap.both",
+                        "name": "软件和代码都缺的能力",
+                        "levels": ["L2"],
+                        "requires": ["ghost2"],
+                        "impact": "degrades",
+                        "gap": "software+code",
+                    }
+                ],
+            ),
+        )
+    )
+    # ① 软件没装：两边都缺，且**不许**标成「装软件就能解决」
+    st3 = M.evaluate(mm3, M.probe_all(mm3))
+    check(st3[0].ok is False, "software+code 的能力被判成可用")
+    check(st3[0].both_gaps is True, "两边都缺的没被标成 both_gaps")
+    check(
+        st3[0].actionable is False,
+        "两边都缺的被标成「装软件可解决」——装完仍不齐，等于让人白跑一趟",
+    )
+    # ② ★ 把软件「装上」之后，仍然**不许**变成可用。
+    #    这一条才是本负例存在的理由：只在装之前断言，就算把 evaluate()
+    #    写成 `c.gap != "code"`（漏掉 software+code）也照样能过。
+    st3b = M.evaluate(mm3, {"ghost2": M.ProbeResult("ghost2", True, usable=True)})
+    check(
+        st3b[0].ok is False,
+        "软件装上之后，缺代码的 fact 被忘了——这正是「一边报可用、一边说不可用」的现场",
+    )
+    check(st3b[0].code_gap is True, "装完软件后没剩代码缺口，说明代码那一半被丢了")
+    check(
+        st3b[0].software_gap is False,
+        "软件明明装上了，software_gap 还是 True——两个状态没分开",
+    )
+    # both_gaps 必须是「两位都还在」，不能是 code_gap 的别名。
+    # 装完软件这一刻正是两者分岔的地方：code_gap 仍为 True，both_gaps 该变 False。
+    # 少了这一条，把 both_gaps 写成 `return self.code_gap` 也照样能过，
+    # 于是「装完软件只剩代码缺口」会被说成「两边都缺」，让人以为还得再装点什么。
+    check(
+        st3b[0].both_gaps is False,
+        "软件已经装上了，却还说「两个都缺」——使用者会去找一个已经装好的软件",
+    )
+
+    # ③ 正向对照：纯 software 的能力装上就该可用，否则上面②可能是「怎么都不 ok」
+    mm4 = M.load(
+        _write(
+            tmp,
+            _minimal(
+                software=[
+                    {"id": "ghost3", "name": "第三个幽灵", "windows": "native",
+                     "check": {"exe": "zznonexistenttool_9f3a"}, "provides": ["cap.only_sw"]}
+                ],
+                capabilities=[
+                    {"id": "cap.only_sw", "name": "只缺软件", "levels": ["L2"],
+                     "requires": ["ghost3"], "impact": "shrinks", "gap": "software"}
+                ],
+            ),
+        )
+    )
+    check(
+        M.evaluate(mm4, {"ghost3": M.ProbeResult("ghost3", True, usable=True)})[0].ok is True,
+        "只缺软件的能力，装上之后却判成不可用——负例②的对照失效",
+    )
+
+    # ④ gap 写了「缺软件」却列不出软件，是句落不了地的话，validate 必须报
+    mm5 = M.load(
+        _write(
+            tmp,
+            _minimal(
+                capabilities=[
+                    {"id": "cap.no_sw", "name": "说了缺软件却没列", "levels": ["L2"],
+                     "requires": [], "impact": "shrinks", "gap": "software"}
+                ],
+            ),
+        )
+    )
+    check(
+        any("落不了地" in p for p in M.validate(mm5)),
+        "gap=software 但 requires 为空，validate 没抓到——报告上会是一句没用的建议",
+    )
 
     # ------------------------------------------------------------ 负例 8b：WSL-only 的软件
     # 缺的软件在 Windows 原生装不了时，**不能**和普通缺失混在一句
@@ -1082,6 +1224,100 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         ST.probe = real_probe
 
+# ---------------------------------------------------------------- 负例 9g：首次安装时目标目录不存在
+#
+# 2026-09-29 装 verible 实测踩到：`_merge_into(staging, dest)` 里 `dest` 是
+# `.tools/verible`，而它**从来不存在**（verible 是本仓库第一个「独占自己归档」
+# 的条目）。于是第一句 `shutil.move` 抛 FileNotFoundError，报错信息是
+# 「系统找不到指定的路径」——**指不到「目标目录没建」这件事上**。
+#
+# 为什么一直没暴露：OSS 套件那 8 个条目共用 `.tools/oss`，而它由**先装的**
+# 组件建了出来；verilator / yosys 谁先装都行，所以这条路径永远走不到。
+# 也就是说，这是个**只在第一次装独立包时**才发作的坑——正是最容易漏测的形状。
+#
+# 这里直接调 `_merge_into`，把「dst 不存在」这个前提**显式造出来**，
+# 并且带一条正向对照（dst 已存在时的正常合并），确认修的是那一处而不是
+# 把合并逻辑改坏了。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+
+    def _tree(root: Path, spec: dict) -> None:
+        """按 {名字: 内容或子 dict} 造目录树。"""
+        root.mkdir(parents=True, exist_ok=True)
+        for name, val in spec.items():
+            if isinstance(val, dict):
+                _tree(root / name, val)
+            else:
+                (root / name).write_text(val, encoding="utf-8")
+
+    # ① dst 不存在 —— 装独立包的第一次，就是这一种
+    #
+    # ★ 这一格**必须只放顶层文件**，不能放子目录，否则这个测试是假的。
+    # 原因是 shutil.move 对**目录**会自己兜底：os.rename 因父目录不存在失败后，
+    # 它退到 copytree，而 copytree 顺手把 dst 建了出来——于是「dst 没建」这个
+    # bug 被掩盖。只有**文件**才会一路走 copy2 → open(dst) 抛 FileNotFoundError。
+    # （verible 的暂存目录里 11 个条目大都是 .exe 文件，所以它一撞就响。）
+    # 第一版这里放了 bin/ 和 share/，结果拿掉 dst.mkdir 断言照样全绿——
+    # 一条**看着在测、其实测不到**的断言，比没有断言更糟。
+    src = tmp / "staging"
+    _tree(src, {"linter.exe": "exe"})       # 刻意只有一个**文件**
+    dst = tmp / "verible"                   # ← 刻意不建
+    check(not dst.exists(), "前置条件不成立：测试自己把 dst 建出来了")
+    try:
+        moved = ST._merge_into(src, dst)
+    except FileNotFoundError as exc:
+        check(False, f"dst 不存在时 _merge_into 抛了 FileNotFoundError：{exc}")
+        moved = -1
+    if moved >= 0:
+        check(moved == 1, f"首次安装合并的条目数不对：{moved}（应为 1）")
+        check((dst / "linter.exe").is_file(), "首次安装没把顶层文件搬过去")
+        check(list(src.iterdir()) == [], f"合并后暂存目录还剩东西：{sorted(p.name for p in src.iterdir())}")
+
+    # ①b 同上，但带嵌套目录（装 verible 的完整形状）
+    src1b = tmp / "staging1b"
+    _tree(src1b, {
+        "bin": {"linter.exe": "exe", "fmt.exe": "exe"},
+        "share": {"rules.txt": "rules"},
+        "README": "doc",
+    })
+    dst1b = tmp / "verible1b"
+    try:
+        moved = ST._merge_into(src1b, dst1b)
+    except FileNotFoundError as exc:
+        check(False, f"带子目录时首次合并也抛了 FileNotFoundError：{exc}")
+        moved = -1
+    if moved >= 0:
+        check(moved == 3, f"首次安装合并的条目数不对：{moved}（应为 bin/share/README 三项）")
+        check((dst1b / "bin" / "linter.exe").is_file(), "首次安装没把 bin/ 搬过去")
+        check((dst1b / "share" / "rules.txt").is_file(), "首次安装没把 share/ 搬过去")
+        check((dst1b / "README").is_file(), "首次安装没把顶层文件搬过去")
+
+    # ② 正向对照：dst 已存在（共用 `.tools/oss` 的那种），要**递归合并**而不是嵌套
+    src2 = tmp / "staging2"
+    _tree(src2, {
+        "bin": {"yosys.exe": "new-yosys", "keep.exe": "new-keep"},
+        "lib": {"a.dll": "new-a"},
+    })
+    dst2 = tmp / "oss"
+    _tree(dst2, {
+        "bin": {"keep.exe": "OLD-keep", "other.exe": "old-other"},
+        "lib": {"zzz.dll": "old-zzz"},
+    })
+    ST._merge_into(src2, dst2)
+    check((dst2 / "bin" / "yosys.exe").is_file(), "已有 dst 时没合并进去（或在错误层级）")
+    check(
+        not (dst2 / "staging2").exists(),
+        "把整个 src 塞进 dst 了（变成 dst/staging2/...）——路径深了一层，探测必然落空",
+    )
+    check(
+        (dst2 / "bin" / "keep.exe").read_text(encoding="utf-8") == "new-keep",
+        "同名文件应以 src 为准覆盖（重装/升级时旧文件必须被顶掉）",
+    )
+    check(
+        (dst2 / "bin" / "other.exe").is_file() and (dst2 / "lib" / "zzz.dll").is_file(),
+        "合并不是覆盖：dst 原有的、src 里没有的文件不能被删掉",
+    )
+
 # ---------------------------------------------------------------- 负例 10：安装护栏
 # WSL-only 的软件必须被拒绝，且**不能发起下载**。
 # 如果这里漏了，装 opensta 会白下几百 MB 再失败。
@@ -1111,6 +1347,8 @@ print("  ✓ 「文件在」与「真能跑」分开判：自检失败的工具�
 print("  ✓ lib_dirs 并入 PATH 而非覆盖（覆盖会让子进程找不到系统命令，且不报错）")
 print("  ✓ repo_private 只认仓库私有安装，系统 PATH 上的同名工具不算（带正向对照）")
 print("  ✓ 归档路径穿越（tar/zip）被拦住，正常归档仍能解压")
+print("  ✓ 首次安装（dst 不存在）能合并；已有 dst 时递归合并、不嵌套、不删旧文件")
+print("  ✓ 真清单里 integration 承认未接入的条目，gap 必定带 code")
 print("  ✓ 包裹层剥离：多层剥离到位、碰到 bin/ 停手、多目录归档不动")
 print("  ✓ WSL-only 的软件被拒绝，不会白下载")
 print("manifest 检查通过")

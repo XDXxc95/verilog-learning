@@ -11,7 +11,7 @@ Verilog 工具链在仓库私有的 `.tools/iverilog/`，脚本自己会去找�
 | `viz.py` | 一键出波形 + 结构图（内部调用 `sim.py`）。**学习时用**，产物进 `build/` |
 | `lesson.py` | 为一讲生成完整产物包。**出课程材料时用**，产物进 `solutions/<讲号>/artifacts/` |
 | `regress.py` | **参数化批量回归**：一个设计 × 一组参数组合，逐个跑再汇总。防「扫了但没扫到区别」 |
-| `synth.py` | **综合与资源估算**：`--compare` 三种状态编码、`--netlist` 出 blif 门级网表。零下载（iverilog `-t sizer` / `-t blif`） |
+| `synth.py` | **综合与资源估算**。零下载两条腿：`-t sizer` 出 FF/门数、`--netlist` 出 blif 网表；`--engine yosys` 是第三条腿——真做优化 + 工艺映射，并支持 `--encoding-compare` 三种状态编码 |
 | `cov.py` | **功能覆盖率合并**：多份测试台的覆盖点**取并集**（不是平均），并抓「命中名拼错」 |
 | `toggle.py` | **逐位翻转计数**：从波形里数状态寄存器翻了多少位（动态功耗的代理量）。零下载，综合器量不出这个 |
 | `check_tools.py` | **按课程级别体检工具能力**，报「缺什么、缺了会怎样、装什么能补」 |
@@ -25,6 +25,10 @@ iverilog 自带的后端就够跑。它们对应的能力项因此是 `gap: "non
 （sizer 给触发器数和门数），`toggle.py` 那半是翻转
 （**综合器量不出来**——yosys 也不做活动性分析，它不知道哪些跳变是"热的"）。
 所以 `synth.encoding` 即使装了 yosys 也只是补齐了一半，另一半永远来自仿真。
+
+★ **「让综合器自己挑编码」2026-09-29 已接入**（`--engine yosys`），做法和上面这两半
+都不是一回事：它不量你已经写好的分配，而是让工具**替你做状态分配**。
+限制见下面「yosys 引擎」一节——`fsm_recode` 只有 one-hot 和 binary，没有 gray。
 
 ## 工具能力清单（`toolchain.json`）
 
@@ -53,15 +57,33 @@ python tools/setup_tools.py --for-level L2 --lock
 | 🟡 `shrinks` | 缩水但主课能上 |
 | ⚪ `talk_only` | **大纲从未承诺能动手**，缺工具不构成缺陷 |
 
-⚠️ **三种「缺」要分清楚，混了就会给出误导性的建议**：
+⚠️ **四种「缺」要分清楚，混了就会给出误导性的建议**：
 
 | `gap` | 含义 | 报告里怎么呈现 |
 |---|---|---|
 | `software` | 缺软件，装了就好 | 进「装上这些可补上面的缺口」 |
 | `code` | **本仓库还没实现**，装什么都没用 | 明说「缺的是代码不是软件」 |
+| `software+code` | **两边都缺**：软件要装，装完还得补代码 | 明说「只补一边都不算齐」 |
 | `software` + WSL-only | 缺的软件 **Windows 原生装不了** | **单列**，不进安装建议 |
 
-第三类最容易搞错：`opensta` / `openroad` 是 WSL-only，`setup_tools.py` 会拒绝安装。
+第三类（`software+code`）是 2026-09-29 加的第 4 个取值，**当前有 6 条**：
+`cov.code`、`lint.style`、`sta.estimate`、`cdc.formal`、`formal.prop`、`formal.lec`。
+其中后 5 条原先标的是 `software`（理由是「卡口是 X 不是代码」），
+但那个理由把**优先级**当成了**状态**——软件装没装，跟代码缺不缺是两件事。
+软件一装，这 5 条就被报成可用，**L3 可用数因此虚高到 11/19，实际是 6/19**。
+它和 `code` **不能挤成一位**：`code_gap` 对「只缺代码」和「两边都缺」都是 True，
+而两句给使用者的下一步完全相反——前者「等仓库补，装什么都没用」，
+后者「可以先装起来，但装完还不齐」。所以 `CapabilityStatus` 上
+`code_gap` / `software_gap` / `both_gaps` 是三个独立的位，
+`evaluate()` 里 `ok` 的条件也从 `gap != "code"` 改成 `not c.needs_code`。
+⚠️ 这 6 条的软件**现在都已就位**，所以 `software_gap` 全是 False、
+`check_tools` 对它们一律输出「缺的是代码不是软件」——
+**别再说它们「要先装 X」**。
+**最要命的是这个谎会延迟发作**：写错成 `software` 时，装之前报告一切正常，
+装上 mingw 那一刻才变成「一边报可用、一边打印 caveat 说不可用」。
+负例见 `check_manifest.py` 负例 8a——它同时验了装之前和装之后两个状态。
+
+第四类最容易搞错：`opensta` / `openroad` 是 WSL-only，`setup_tools.py` 会拒绝安装。
 如果它们被混进「装上这些可补」的清单里，使用者照着装会发现装不上——所以
 `CapabilityStatus.unavailable_software` 把它们单拎出来，并且**不算 `actionable`**。
 `setup_tools.py --for-level` 取的正是过滤后的清单，不会白下载。
@@ -96,9 +118,15 @@ yosys-slang-plugin，没有独立的 slang.exe」，实测 `.tools/oss/bin/slang
    不去重就会把同一份 16953 条目的 tgz 解压八遍、往磁盘写八遍 2 GB ——
    不报错、只是白干。
 2. **`--list` 的「下载量」列只在第一条打印体积**，其余标 `↳yosys`，并在末尾用脚注
-   说明哪几条共用。否则七行都印 572.2 MB，读起来像要下七次。
+   说明哪几条共用。否则八行都印 572.2 MB，读起来像要下八次。
    列名从「体积」改成「**下载量**」也是这个原因：它的含义是「装它要下多少」，
    不是「它自己多大」。
+
+⚠️ **`verible` 是唯一不共这个整包的条目**（2026-09-29 装，6.9 MB 独立 zip，
+落到 `.tools/verible`）。它也是**第一个独占自己归档**的条目——正因为前面 8 条
+全都共用 `.tools/oss`、而那个目录由先装的组件顺手建了出来，
+`_merge_into` 里「目标目录还不存在」这条路径**一直没被走到**，一装 verible 就抛
+`FileNotFoundError`（详见 `setup_tools.py` 里那段注释和 `check_manifest.py` 负例 9g）。
 
 负例见 `check_manifest.py` 负例 9d（含两条反向对照：换了归档必须真装、
 脚注不许把独占自己归档的条目也算进去）。
@@ -110,13 +138,14 @@ yosys-slang-plugin，没有独立的 slang.exe」，实测 `.tools/oss/bin/slang
 | 目录 | 占用 | 是什么 | 能删吗 |
 |---|---|---|---|
 | `.tools/oss` | **2.1 GB** | 整包解压出来的东西（含 slang / gtkwave / eqy / sby 等 8 个条目的内容） | ❌ 别无选择，它就是这个量和这个位置 |
-| `.tools/_cache` | 598 MB | 下载原件（整包 572 MB + iverilog 安装包 27 MB） | ❌ **别删**，见下 |
+| `.tools/_cache` | 605 MB | 下载原件（整包 572 MB + iverilog 安装包 27 MB + verible 6.9 MB） | ❌ **别删**，见下 |
 | `.tools/iverilog` | 85 MB | iverilog + gtkwave | ❌ 课程 L1 起就要用 |
+| `.tools/verible` | 17 MB | Verible 的 11 个可执行文件（**唯一一个不共 `.tools/oss` 的独立包**） | ❌ 装了才有的那点能力就靠它 |
 
 **只有缓存可删，而缓存恰恰不该删**：`--verify-lock` 是拿缓存里的文件算 sha256
-去对锁记录的。缓存不在，它只能报「无法校验 4」——**全绿变成全没查**，
+去对锁记录的。缓存不在，它只能报「无法校验 5」——**全绿变成全没查**，
 而锁存在的意义正是防那份 572 MB 被截断或换掉（静默截断这事真发生过，见下）。
-省 598 MB 把这道校验废掉，不划算。
+省 605 MB 把这道校验废掉，不划算。
 
 **目前没有卸载 / 回收命令**，`.tools/` 是 gitignore 的、删了就得重下 572 MB。
 装之前先确认磁盘够 —— 这张表是使用者第一次跑 `--install yosys --lock`
@@ -255,10 +284,11 @@ python tools/lesson.py --all          # 全部重生成
 常用命令见根目录 `README.md`。每个脚本 `--help` 都有完整说明和示例。
 
 ## `regress` / `synth` / `cov` / `toggle`：四个入口守的一条数
+（表里最后一行是 `synth.py` 的一个旗标，不是第五个入口。）
 
-这四个入口看着不相干，其实守的是**同一条纪律**——而这条纪律在本仓库已经栽过四次
+这四个入口看着不相干，其实守的是**同一条纪律**——而这条纪律在本仓库已经栽过五次
 （`lint.ran` vs `lint.n_warnings`、`n_ok` vs `n_sizer_ok`、`n_runs` vs `n_runs_with_cover`、
-`n_changes` vs `total_bit_toggles`）：
+`n_changes` vs `total_bit_toggles`、`comparable` vs `identical`）：
 
 > **「没做」和「做了但结果为零」在下游长得一模一样，含义相反。**
 > 凡是这两种情况都可能出现的量，就必须拆成两个字段报。
@@ -266,7 +296,8 @@ python tools/lesson.py --all          # 全部重生成
 | 入口 | 拆开的两个数 | 混了会怎样 |
 |---|---|---|
 | `regress.py` | `n_combos`（跑了几组） / 真的比出差异的对照组数 | 每组跑的都是同一个电路，全绿、退出码 0、毫无异常——和「完全没工作」无法区分 |
-| `synth.py` | `n_ok`（整体成功） / `n_sizer_ok`（资源估算成功） | sizer 的数字照常可信、只是网表出不来时被报成「你的写法综合不了」，是假话 |
+| `synth.py` | `n_ok`（整体成功） / `n_sizer_ok`（资源估算成功） / **`n_yosys_ok`（yosys 那条腿成功）** | sizer 的数字照常可信、只是网表出不来时被报成「你的写法综合不了」，是假话。混进同一个数就没法表达「iverilog 那条腿成了、yosys 这条腿没成」 |
+| `--encoding-compare` | `comparable`（状态机认出来了） / `identical`（三种编码数字果然相同） | 没认出 FSM 时三次必然相同，混成一个数就会把它报成「编码对面积没影响」——那是一条**看着有结论的假结论** |
 | `cov.py` | `n_runs`（跑了几份） / `n_runs_with_cover`（其中几份带覆盖数据） | 没声明覆盖点的那份被当成「覆盖了 0 个点」，把合并比值拉低 |
 | `toggle.py` | `n_changes`（状态变了几次） / `total_bit_toggles`（一共翻了几位） | **一次变化可以翻多位。**同一台 4 位计数器、同一套激励：二进制 34 次变化 / 63 位翻转，格雷 34 次变化 / 34 位翻转。只报 `n_changes` 会得出「两种编码一样」的错结论 |
 
@@ -280,6 +311,10 @@ python tools/lesson.py --all          # 全部重生成
 但 iverilog 的 blif 后端没实现，报 `Asynchronous clear not implemented yet`——
 它有独立归类 `async_reset_unsupported`，提示语里明写「**这不是你的写法问题**」。
 混进 `not_synthesizable` 会让学习者去改一份本来完全正确的 RTL。
+**2026-09-29 起这件事有了第二份证据**：`--engine yosys` 对同一份异步复位设计照常出
+数字，`cross_check` 会把它归成 `yosys_handles_it`。跟踪「这是工具边界不是你的问题」
+因此从「一句承诺」变成了「两条腿对得上的结论」——注意是**对得上**，不是「并不矛盾」
+就当没看见：两边的结论仍然各摆各的。
 
 另外 `ok` 必须把「用户显式要了网表却没出」算进去，否则就成了
 「跑绿了但你要的东西不在」——这是本仓库最要避免的那种报绿，
@@ -322,6 +357,85 @@ python tools/lesson.py --all          # 全部重生成
 > `toggle.py` 拆过六条：两个计数混为一谈、x/z 也算进翻转、可比性恒真、
 > 去掉同文件拦截、`bits_per_change` 换分母、窗口首格丢前值——六条都红。
 
+## yosys 引擎（`--engine yosys`，2026-09-29 接入）
+
+`synth.py` 默认那条腿是 iverilog：`-t blif` 出网表、`-t sizer` 估资源。
+它**只做翻译不做优化**，给的是工艺无关网表——够讲「组合逻辑怎么变成门」，
+讲不了映射、面积优化。`--engine yosys` 补的就是这一段：真跑
+`proc → opt → fsm → techmap → abc`，然后报**映射成逐 bit 门之后的**门数。
+
+```bash
+python tools/synth.py tests/_smoke/fsm_bin.v --engine yosys --pretty
+python tools/synth.py tests/_smoke/fsm_bin.v --engine yosys --encoding-compare --pretty
+python tools/synth.py tests/_smoke/fsm_bin.v --engine yosys --fsm-encoding binary
+```
+
+★ **它是「多加一条腿」，不是「换掉 iverilog 那条」。** 两条腿对同一份 RTL 的结论
+会不一样，报告里两侧都摆出来（`designs[i].cross_check`）。已知的两类分歧：
+
+| 分类 | 什么时候 | 怎么说话 |
+|---|---|---|
+| `yosys_handles_it` | iverilog 的 blif 后端没实现异步复位，yosys 照常出数字 | **明说「你的 RTL 没问题」**——这是工具的能力边界 |
+| `disagreement` | 一边说合不了、另一边给出了数字 | 挑明这是两份证据打架，**绝不只报乐观的那一个** |
+
+### 固定 pass 列表，写死在 `_yosys.py` 里
+
+```
+read_verilog [-sv] [-D…] [-I…] <abs posix path>
+hierarchy -check -top <top>      (或 -auto-top)
+proc
+opt
+fsm [-encoding one-hot|binary]   (不指定 = 让综合器自己挑)
+opt
+techmap
+opt
+abc
+opt
+tee -o <statfile> stat
+```
+
+**不同 pass 顺序给出的数字不可比**（实测过），所以列表写死并在 JSON 里原样输出。
+改它等于换了一把尺子，报告里会跟着变。
+
+### 四条实测出来的硬事实（改这块之前先看 `_yosys.py` 的模块头）
+
+1. **「退出码 0」和「有输出」都不是跑过的证据。** 空文件 rc=0、日志打着
+   `Printing statistics.`、但一个模块块都没有；缺 DLL 时更是 rc=0 且**零字节**。
+   硬判据取 **`=== <module> ===` stat 块存在**——和 `_vlint.py` 拿
+   `Verilation Report` 当判据同一条道理。所以 `started` / `reached_stat` / `ran`
+   / `ok` 是**四个独立的位**。
+2. **仿真专用的 cell 会活到 `abc` 之后，退出码还是 0。** `tests/_smoke/synth_unsynth.v`
+   （含 `$display` / `#2` / `initial`）跑出来是 **96 个 cell**，里头躺着 `$print`。
+   直接报「96 个门」就是假话。报告里 `gate_count_meaningful` 翻 `false`，
+   门数照给但标为不可当结论用，并把 cell 名列出来。
+3. **`#延迟` 被静默丢弃**，日志里一句警告都没有（`$monitor` 反倒会警告）。
+4. **「没认出来状态机」≠「编码对面积没影响」。** `fsm_recode` 没认出 FSM 时
+   `-encoding` 是静默空操作，三种编码量出来一模一样。所以
+   `--encoding-compare` 的结果里带 `comparable` / `identical` 两个位：认不出来就
+   明说「本次没能比较」，**绝不把三次相同的数字摆成一张看着像结论的表**。
+
+> ★ 一并纠正一条**测错了的**旧结论：探索阶段一度以为 `opt -nodffe -nosdff`
+> 不能省（省了 `fsm_detect` 认不出状态机）。**复测三份夹具后不成立**——
+> `proc; opt; fsm -encoding X` 与 `proc; opt -nodffe -nosdff; fsm -encoding X`
+> 给出的 cells / 触发器位**逐项相同**。所以 `PIPELINE` 里用的是普通的 `opt`。
+> 真正会让「引擎其实没生效」的症状（三编码数字全同）出现在**把 `fsm` 整个删掉**时,
+> 那也正是变异测试用的那一刀。
+
+### 做不到什么
+
+- **不是真实面积。** `abc` 没带 `-liberty`，用的是内置通用映射
+  （`$_AND_` / `$_DFF_*` 这些），比 sizer 可信得多但仍**只能横向比**。
+  本仓库没有工艺库文件，接上也不是签核级数字。
+- **只支持 one-hot 和 binary。** `fsm_recode` 没有 gray / johnson，
+  传别的值**直接报错**（`synth.py` 会以退出码 64 挡下并说明原因）。
+  课程讲三种编码，综合器能替你挑的只有两种——格雷必须自己在 RTL 里写。
+- **不改变任何判定。** 综合产物回答的是「这么写合成出多少硬件」，
+  对错仍然只由 `sim.py` 说了算。
+
+`--encoding-compare` / `--fsm-encoding` **脱离 `--engine yosys` 会被挡下**（退出码 64），
+而不是静默换成 yosys——否则命令行上写着 `--fsm-encoding`、跑的却是 iverilog，
+数字照样出得来、还看着挺合理。
+
 ## 内部模块（不要直接当命令跑）
 
 以下划线开头的是内部共享模块：
@@ -333,6 +447,7 @@ python tools/lesson.py --all          # 全部重生成
 | `_proc.py` | 子进程执行 + Windows 上的进程树强杀（job object 为主，`taskkill /F /T` 兜底）+ 超时 |
 | `_lint.py` | 源码静态检查，目前只做一件事：**抓组合逻辑推断出的锁存器**。策略是"宁可漏报，不可冤枉" |
 | `_vlint.py` | 调外部 verilator 做真 lint（位宽 / 组合环 / 多驱动 / 未驱动 / 未使用）。**只加 warning，永不改 status**，详见下节 |
+| `_yosys.py` | 调外部 yosys 做综合与工艺映射。定位 / 固定 pass 列表 / `stat` 解析 / 失败归类 / **非硬件 cell 检测**。硬判据是 stat 块存在，不是退出码 |
 | `_observe.py` | 从 VCD 里量出「可以照着讲」的事实（时钟、首次分歧在第几个沿、每个信号动没动过）。**只测量不推断**，拿不准给 `null` |
 | `_console.py` | 把控制台切到 UTF-8。**每个 CLI 入口都要调 `init_console()`**，否则 GBK 控制台遇到 `✓` 会崩 |
 
@@ -372,7 +487,14 @@ python tests/_smoke/run_smoke.py
 ```
 
 26 个仿真用例 + 12 个工具检查（波形 JS/DOM 两个需要 node，缺了自动跳过；
-5 个用例和 `check_vlint.py` 需要 verilator，缺了报 `⊘` 跳过而不是判失败）。
+**2 个**用例和 `check_vlint.py` 需要 verilator，缺了报 `⊘` 跳过而不是判失败）。
+
+★ 这三个数**别照抄**，跑一遍就有：用例数看那行 `冒烟测试全部通过：N/N`，
+检查器数看 `grep -c "检查通过$"`，需要 verilator 的看
+`grep -c "needs_verilator=True" tests/_smoke/run_smoke.py`。
+（这里原先写的是「5 个用例」，2026-09-29 更正为 2——加了几套检查器之后
+没人回头改数字，而数字一旦过时就成了一句没人验过的断言。）
+
 加新能力时**同时加一个负例**——能证明它真的抓得到错，否则不算完成。
 
 ★ **断言必须写成「这个量等于几」，不能只是「打印出来看看」。** 一个结构性的回归
@@ -402,7 +524,7 @@ lint 那几条负例里有两个刻意的设计，别"优化"掉：
 `check_manifest.py` 里那几组负例值得注意，它们防的是**「坏输入但照常报成功」**：
 
 - 清单坏了（JSON 错、悬空引用、未知 impact）→ 必须**大声报错**，绝不能降级成空清单谎报「全部可用」
-- `gap: "code"` 的能力没有软件依赖，如果不显式排除，会被判成 `ok=True`——于是「多参数批量回归」这种压根没写的功能显示「可用」
+- `gap` 带 code 的能力（`code` / `software+code`）如果不在 `evaluate()` 里显式排除，会被判成 `ok=True`——于是「多参数批量回归」这种压根没写的功能显示「可用」；`software+code` 更隐蔽，它 requires 列着真软件，装上就「齐了」，而 `integration` 里明明写着「仓库有活干」
 - **「文件在」不能当成「能用」**：能力依赖的满足条件是 `found and usable`。少了 `usable` 这一半，一个启动就崩的工具照样能把能力"补齐"，报告上却看不出任何异常
 - `lib_dirs` 必须**并入** PATH 而不是覆盖它——覆盖不报错、不崩溃，只是子进程再也找不到系统命令
 - **WSL-only 的依赖必须和可安装的依赖分开报告**，否则「装上这些可补」会列出一份装不上的清单，`--for-level` 还会照着它去发起下载

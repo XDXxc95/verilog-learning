@@ -116,7 +116,8 @@ solutions/L1-05/decoder3_8.v       参考答案
 | 我的实现 vs 参考答案对照 | `python tools/viz.py --compare solutions/L1-05/decoder3_8.v exercises/L1-05/decoder3_8.v --tb tests/L1-05/tb_decoder3_8.v --top decoder3_8` |
 | 生成一讲的产物包（出课程材料用） | `python tools/lesson.py L1-05` |
 | **参数化批量回归** | `python tools/regress.py <design.v> --tb <tb.v> --top tb_x --param WIDTH=4,8` |
-| **综合 / 资源估算 / 门级网表** | `python tools/synth.py <design.v> --top x --compare bin,onehot,gray` / `--netlist` |
+| **综合 / 资源估算 / 门级网表**（零下载） | `python tools/synth.py <design.v> --top x`（FF/门数估算）/ `--netlist`（blif 网表） |
+| **真做综合 + 工艺映射 / 编码对比**（需 yosys） | `python tools/synth.py <design.v> --top x --engine yosys --encoding-compare` |
 | **功能覆盖率合并**（多份测试台） | `python tools/cov.py tests/L2-40/*.json` |
 | **状态寄存器逐位翻转计数**（编码取舍的另一半） | `python tools/toggle.py build/bin.vcd build/gray.vcd --signal st` |
 | **按级别体检工具能力** | `python tools/check_tools.py --level L2` |
@@ -297,6 +298,11 @@ python tools/setup_toolchain.py --selftest   # 装完编译+仿真跑一遍验�
   `toggle.py`（状态寄存器逐位翻转计数，量的是**编码代价的另一半**——
   综合器不做活动性分析，这一半只有仿真知道）。
   **都不需要额外装任何东西**，对应的能力项因此是 `gap: "none"`。见 [`tools/README.md`](tools/README.md)
-- ✅ **工具清单已无「缺代码」项** —— 25 项能力里 `gap` 只剩 `none` / `software` 两种；
-  剩下要装的（yosys / verilator / mingw / sby…）**卡口是软件本身，不是仓库欠代码**
+- ⚠️ **工具清单里有 6 项「缺代码」** —— `cov.code`、`lint.style`、`sta.estimate`、
+  `cdc.formal`、`formal.prop`、`formal.lec`，标着 `gap: "software+code"`：它们要的
+  软件（verilator + mingw / verible / yosys / sby / eqy / z3）**都已经装好了**，
+  缺的是**本仓库自己的接入代码**，所以装软件并不改变它们的状态。
+  ⚠️ 这 6 条里有 5 条的 `gap` 原先写的是 `software`，且 `integration` 里自己写着
+  「仓库有活干」——**软件一装，`check_tools` 就把它们报成可用**，L3 的可用数因此
+  虚高到 11/19（真实是 6/19）。2026-09-29 更正。其余 19 项不是 `none` 就是 `software`
 - ⬜ **开始学习** —— 等明确指令，届时**先新建学习分支**，再选级别

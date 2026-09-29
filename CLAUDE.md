@@ -226,10 +226,12 @@ solutions/L1-05/artifacts/decoder3_8/   实际运行产物（lesson.py 生成）
 
 几条别搞错的：
 
-- **`gap` 分两种**：`software` = 缺软件（装了就好）；`code` = **本仓库还没实现**（装什么都没用）。混了会让使用者去装没用的工具。`evaluate()` 里 `gap=="code"` 必须显式排除——这类能力通常 `requires` 为空，不排除就会判成「可用」。
+- **`gap` 有四种取值**：`none` / `software`（装了就好）/ `code`（装什么都没用）/ **`software+code`（两边都缺：软件要装，装完还得补本仓库的代码）**。混了会让使用者去装没用的工具，或者以为装完就齐了。`evaluate()` 的判据是 `not c.needs_code`——**必须显式排除，不排除就会判成「可用」**。★ 第 4 种是 2026-09-29 加的：原先只能二选一，而两个选项都会骗人，**且这个谎延迟到「装上软件那一刻」才发作**（装之前报告一切正常）。**当前有 6 条落在里面**：`cov.code`（要写覆盖率接入）、`lint.style`（要调 verible 并挑规则集）、`sta.estimate`（要调 yosys + abc）、`cdc.formal` / `formal.prop` / `formal.lec`（要写 `.sby` 作业或 eqy 划分脚本）。⚠️ 后 5 条原先标的是 `software`，而它们的 `integration` 里自己就写着「仓库有活干，但卡口是 X 不是代码」——**「先装软件再写代码」是个优先级判断，不是 `gap` 的取值**。`gap` 描述的是当下状态，跟软件装没装无关；软件一装它们就被报成可用，L3 可用数因此虚高到 11/19（实际 6/19）。**别再用「卡口是 X 不是代码」当 `gap: "software"` 的理由。** `code_gap` / `software_gap` / `both_gaps` 在 `CapabilityStatus` 上是三个独立的位，别挤成一个。
+  ★ **反过来的一条同样要守：有零下载回退路径的能力就算 `software`。** `synth.run` / `synth.area` / `synth.encoding` 三条**装了 yosys 会更好，不装也不塌**——iverilog 自带的 `-t blif` / `-t sizer` 零下载就能出网表和 FF/门数，`tools/toggle.py` 零下载就能量翻转。所以它们标 `software` 是对的，**别因为「装了 yosys 才完整」就改成 `software+code`**：那会凭空给使用者加一个"仓库有活干"的假缺口，而他手上其实有条能跑的路。判据是「**不补这个软件，这条能力今天能不能动手**」，不是「补了会不会更好」。
+  ★ 2026-09-29 **yosys 综合已接入**（`tools/_yosys.py` + `synth.py --engine yosys`）：这三条的 `integration` 里承诺的「让综合器自己挑编码」「真正做优化+映射后的面积」**现在是真的了**，别再照着旧文字说"装了没接入"。`sta.estimate` 等四条**仍**是 `software+code`，一条都没减少——它们要的 `abc -liberty` / `.sby` 作业 / eqy 划分脚本**一行都没写**，共用 `_yosys.py` 的只是定位和进程管理那点地基。
 - **影响分级四级**：`blocks`（整讲做不了）/ `degrades`（动手环节塌掉）/ `shrinks`（缩水但主课能上）/ `talk_only`（**大纲从未承诺能动手**）。`talk_only` 那几项（STA、DFT、功耗）缺工具**不构成课程缺陷**，别急着改大纲。
 - **「文件在」不等于「能用」，探测必须真跑一次**。能力的满足条件是 `found and usable`，不是 `found`。`check` 里三个字段都在为这件事服务：`env`（运行必需的环境变量）、`lib_dirs`（并入 PATH，**不是覆盖**）、`functional.args`（功能自检，退出码非 0 即不可用）。只查 `--version` 等于没查——**verilator 版本号打得出来但 lint 失败**（构建期烘死了 `VERILATOR_ROOT=/yosyshq`），**系统 PATH 上的 g++ 也可能是个太旧的编译器**。这两类误报都实测复现过。
-- **OSS CAD Suite 只装整包，别装分组件**（2026-09-28 踩的分组件，09-29 整包推翻了它）。分组件 Windows 资产不自包含：`windows-x64-yosys.tgz` 里一个运行时 DLL 都不带（yosys.exe 要 libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1 一整组），启动即 `STATUS_DLL_NOT_FOUND(0xC0000135)`，**没有任何输出也没有报错**。而且这不是「补几个 DLL」能修的：整包与 bleyer iverilog 的 `libstdc++-6.dll` 有 C 库 ABI 分裂（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），顶上去只会换成 `STATUS_ENTRYPOINT_NOT_FOUND(0xC0000139)`。**整包（572 MB）已实测全绿**：yosys 0.69+154 / verilator_bin 5.053 / z3 4.15.5 / sby / eqy / slang / gtkwave 逐一起得来，形式验证真跑通了一个 k-induction 作业；代价是 `.tools/oss` 占 2.1 GB，而且**没有卸载/回收路径**。清单里 7 个条目共用这一个归档，靠 `(repo, tag, asset)` 判重只下一次。
+- **OSS CAD Suite 只装整包，别装分组件**（2026-09-28 踩的分组件，09-29 整包推翻了它）。分组件 Windows 资产不自包含：`windows-x64-yosys.tgz` 里一个运行时 DLL 都不带（yosys.exe 要 libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1 一整组），启动即 `STATUS_DLL_NOT_FOUND(0xC0000135)`，**没有任何输出也没有报错**。而且这不是「补几个 DLL」能修的：整包与 bleyer iverilog 的 `libstdc++-6.dll` 有 C 库 ABI 分裂（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），顶上去只会换成 `STATUS_ENTRYPOINT_NOT_FOUND(0xC0000139)`。**整包（572 MB）已实测全绿**：yosys 0.69+154 / verilator_bin 5.053 / z3 4.15.5 / sby / eqy / slang / gtkwave 逐一起得来，形式验证真跑通了一个 k-induction 作业；代价是 `.tools/oss` 占 2.1 GB，而且**没有卸载/回收路径**。清单里 **8 个条目**共用这一个归档（yosys / verilator / formal / eqy / z3 / slang / oss-utils / oss-system-resources），靠 `(repo, tag, asset)` 判重只下一次；`verible` 是唯一独占自己归档的条目（6.9 MB 独立 zip → `.tools/verible`）。★ 正因为它独一无二，`_merge_into` 里「目标目录还不存在」那条路径第一次被走到就抛了 `FileNotFoundError`——共用 `.tools/oss` 的 8 条永远走不到。加新的独立包时留意这里。
 - **verilator 编译链的瓶颈是编译器，不是 make**。本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017），而 verilator 按 GCC 15.2.1 配的；逐个绕过 `-fcf-protection=none` / `python3` / `-lpsapi` / `WinMain` 四个坑也不牢靠。要打通得装现代 mingw-w64（`mingw` 条目，约 250 MB，且候选里只有 winlibs 给 `.zip`——其余只有 `.7z`/`.tar.zst`/自解压 exe，标准库解不了或违反「不运行下载来的可执行文件」）。
 - **L1 必须零缺口**（只依赖 iverilog）。往清单里加 L1 的能力要慎重，会凭空造出缺口。
 - **可复现性**：OSS CAD Suite 的 `bucket-*` 是滚动 tag，同名资产每天覆盖。要固定版本得 `--lock` 记 sha256。
@@ -238,7 +240,9 @@ solutions/L1-05/artifacts/decoder3_8/   实际运行产物（lesson.py 生成）
 
 ## 改 `tools/` 的规矩
 
-- 改完**必须**跑 `python tests/_smoke/run_smoke.py`，全绿才算完。里面有 19 个仿真用例 + 8 个工具检查（波形 JS/DOM 两个需要 node，缺了会自动跳过；5 个用例需要 verilator，缺了报 `⊘` 跳过而不是判失败）。
+- 改完**必须**跑 `python tests/_smoke/run_smoke.py`，全绿才算完。里面有 **26 个仿真用例 + 12 个工具检查**（波形 JS / 波形交互两个需要 node，缺了会自动跳过；**只有 2 个**用例需要 verilator，缺了报 `⊘` 跳过而不是判失败）。
+
+  ★ 这三个数字 2026-09-29 更正过一次：原先写的是「19 个仿真用例 + 8 个工具检查」「5 个用例需要 verilator」，加了几套检查器之后没人回头改。**别照抄数字，跑一遍就有**——用例数看那行 `冒烟测试全部通过：N/N`，检查器数看 `grep -c "检查通过$"`，需要 verilator 的看 `grep -c "needs_verilator=True" tests/_smoke/run_smoke.py`。
 - 加新能力时，**同时加一个负例**（能检出错误的用例）。现有负例覆盖：锁存器推断、**组合环（iverilog 沉默）**、零延迟死循环、`wait` 挂死、阻塞赋值导致流水线塌陷、语法错误、顶层名写错、测试台不输出标记、**verilator 缺席时如实报「没跑」**、**程序起来了但不是 verilator**、**`--no-lint` 关得掉且判定逐字段不变**。
 - **`SimConfig` 加字段会打断所有构造点**（`lesson.py` / `viz.py` 各有一处）。已经栽过两次，加字段前先搜一遍。
 - 工具的设计哲学是**「宁可说画不出来，也不画一个看着合理但是错的」**。`schematic.py` 对 `generate` 的落地版是：**默认值能算出圈数就展开，算不出来就只丢那一个区域**（图上写明理由，手写部分照画），绝不猜份数——猜出来的 N 会生成一张看着合理、读者无从察觉的错图。`case` generate 明确不支持。详见 `schematic.py` 文件头的取舍清单，改之前先读它。

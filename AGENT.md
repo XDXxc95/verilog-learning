@@ -49,8 +49,12 @@ python tools/viz.py <设计.v> --tb <测试台.v> --top <顶层> --open
 python tools/regress.py <设计.v> --tb <测试台.v> --top <顶层> --param WIDTH=4,8
 
 # 综合 / 资源估算 / 门级网表（讲"这段代码综合成什么"时）
-python tools/synth.py <设计.v> --top <顶层> --compare bin,onehot,gray
-python tools/synth.py <设计.v> --top <顶层> --netlist
+python tools/synth.py <设计.v> --top <顶层> --netlist            # 零下载：iverilog -t blif 工艺无关网表
+python tools/synth.py <设计.v> --top <顶层>                      # 零下载：-t sizer 出 FF / 门数估算
+python tools/synth.py <设计.v> --top <顶层> --engine yosys --encoding-compare   # 需 yosys：真的做综合+映射
+# ★ 上面是**两条独立的腿**，不是一条。报告里 cross_check 专门记录它们打架的地方
+#   （iverilog 判不了异步复位的 blif，yosys 照出数字 —— 那时要说"你的 RTL 没问题"）。
+#   --encoding-compare 只支持 auto/one-hot/binary：yosys 的 fsm_recode 没有 gray。
 
 # 功能覆盖率合并（多份测试台覆盖同一批覆盖点时）
 python tools/cov.py build/sim/a.json build/sim/b.json
@@ -66,15 +70,26 @@ python tools/lesson.py L1-05
 ```
 
 ★ **转述这四个入口的结果时，别把「没做」和「做了但结果为零」说成一回事**：
-`regress` 的 `n_combos` / `synth` 的 `n_sizer_ok` / `cov` 的 `n_runs_with_cover` /
-`toggle` 的 `n_changes`（变化次数，与 `total_bit_toggles` 翻位数分开）
+`regress` 的 `n_combos` / `synth` 的 `n_sizer_ok` 和 `n_yosys_ok` /
+`cov` 的 `n_runs_with_cover` / `toggle` 的 `n_changes`（变化次数，与
+`total_bit_toggles` 翻位数分开）/ `synth --encoding-compare` 的
+`comparable`（状态机认没认出来）与 `identical`（三种编码果然相同）
 都是**和总数分开报的第二个数**。覆盖率合并**只能取并集不能取平均**——
 平均会在两个方向上都错，高报那一侧尤其危险（看着挺勤快）。
+
+★ **`--encoding-compare` 的 `comparable=false` 只有一个正确说法**：yosys 没认出
+状态机，所以**这次没能比较**。三种编码数字一模一样时，`identical=true` 配上
+`comparable=false` 是「没比成」，配上 `comparable=true` 才是「真的没差别」——
+**长得一样，含义相反**。别把前一种说成「编码对面积没影响」。
 
 **讲状态编码时必须两个数都讲**，因为它们回答的是两个问题：
 
 - `synth.py` → **面积**（几个触发器、多少门）。sizer 对"状态寄存器变宽"敏感
   （独热 4 FF），对"同宽度下换编码"**完全不敏感**（bin 和 gray 都是 2 FF / 21 门）。
+  ★ `--engine yosys` 那条腿比 sizer 可信（真做了优化 + 映射），但**仍不是真实面积**——
+  `abc` 没带 `-liberty`，只有内置通用门，**只能横向比**。而且它带着两个沉默的坑：
+  `#延迟` 被静默丢弃（一句警告都没有）、含 `$display` 的设计能跑出「96 个门」
+  而退出码是 0（报告里 `gate_count_meaningful` 会翻 `false`，门数照给但**不能当结论用**）。
 - `toggle.py` → **翻转**（动态功耗的代理量）。这才是格雷真正的卖点，而
   **yosys 也不量这个**——综合器不做活动性分析，不知道哪些跳变是"热的"。
 
@@ -208,11 +223,37 @@ agent 把「写码 → 立刻出波形」做得太顺滑，学习者会永久跳
 | 能力可用 | 正常跑 |
 | `gap: "software"` | 「这个能力需要装 X（约 200MB）。要装吗？不装的话这部分只能讲原理。」 |
 | `gap: "code"` | 「这个功能本仓库还没实现，装什么工具都没用。」 |
+| `gap: "software+code"` | 「这个要先装 X，**而且装完也还不够**——本仓库这边还没写接入代码。两边都得补上才行。」 |
 | `unavailable_software`（WSL-only） | 「STA / CDC / DFT / 功耗这几项在 Windows 原生跑不了。我可以讲原理、带你手算 slack、读报告样例，但**我不能说'验证过了'**。」 |
 
-> `gap: "code"` 那一行现在**没有能力落在里面**——25 项能力只剩 `none` 和 `software` 两种。
-> 剩下的缺口（yosys / verilator / mingw / sby…）**卡口是软件本身，不是仓库欠代码**。
-> 这行留着是因为它描述的是**机制**：将来要加的新能力，没实现完就得诚实地标成 `code`。
+> `gap: "code"` 那一行现在**没有能力落在里面**。`software+code` 那行**有 6 条**：
+> `cov.code`（要写覆盖率接入）、`lint.style`（要调 verible 并挑规则集）、
+> `sta.estimate`（要调 yosys + abc）、`cdc.formal` / `formal.prop` / `formal.lec`
+> （要写 `.sby` 作业或 eqy 划分脚本）。它们的软件都已经装好了，
+> **所以「要装 X」在这 6 条上已经不成立，只能说「本仓库还没写」**。
+> 这几行留着是因为它们描述的是**机制**：将来要加的新能力，
+> 没实现完就得诚实地标出来。
+>
+> ★ 这一条是 2026-09-29 补上的，原因是`gap` 原先只有 `software` / `code` 两种取值，
+> 而「软件和代码都缺」只能二选一，**两个选项都会骗人**：写 `software`，软件一装
+> `evaluate()` 就判它可用（而 `integration` 里明写着「仓库有活干」）；写 `code`，
+> 又说成「装什么都没用」，可软件确实是卡口之一。**而且这个谎要等到装上软件那天
+> 才发作**，在那之前所有报告看着都正常。
+>
+> ⚠️ **说这 6 条时别提「要先装软件」**——它们的软件已经就位（OSS 套件 + verible），
+> 现在缺的只有本仓库的接入代码。说错了会让使用者跑去装一个已经装好的东西。
+>
+> ★ **另一头也要管住：别把 `synth.run` / `synth.area` / `synth.encoding` 说成
+> 「装了没接入」。** 2026-09-29 起 yosys 综合**真的接进去了**
+> （`python tools/synth.py <设计.v> --engine yosys`，含 `--encoding-compare`）。
+> 它们之所以仍标 `gap: "software"` 而不是 `software+code`，是因为**不装 yosys
+> 也有零下载的路**（iverilog `-t blif` / `-t sizer` + `tools/toggle.py`）——
+> `gap` 描述的是**当下状态**，不是「装了会不会更好」。
+> ⚠️ 讲编码对比时顺带要说的限制：yosys 的 `fsm_recode` **只有 one-hot 和 binary，
+> 没有 gray / johnson**——课程讲三种编码，综合器能替你挑的只有两种。
+>
+> 遇到它时你不能只说其中一句。说「装上 mingw 就能做覆盖率」是谎，
+> 说「装什么都没用」也是谎。
 
 **最后一行是最要紧的。** 环境越流畅，越容易顺手编一个"看起来对"的结果出来。
 在这个仓库里，老实说「这个我跑不了，只能手算」永远比含糊过去强。

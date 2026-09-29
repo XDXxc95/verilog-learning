@@ -290,6 +290,207 @@ def main() -> int:
     check(ffs == [2, 3], f"两份的合计应各归各（2、3），实际 {ffs}")
     print("  ✓ 单顶层 1 份、两顶层 2 份，合计各归各，无残留未解析行")
 
+    # ============ 8. yosys 引擎（--engine yosys）—— 它自己特有的沉默失败 ============
+    #
+    # 前面七节覆盖的全是 iverilog 那条腿。这一节补的是 yosys 那条腿**独有**的坑：
+    #   ① 非硬件 cell 会活到 abc 之后、退出码还是 0（直接报"96 个门"就是假话）
+    #   ② 「退出码 0」和「有输出」都不是跑过的证据（空文件 rc=0 且日志正常）
+    #   ③ 「没有状态机」和「编码没影响」在下游都是一张相同的表，含义相反
+    #   ④ yosys 备齐了、引擎却没生效 —— 和"引擎正常工作"在下游长得一样
+    # 每条都要能变红，变异方式写在各自的注释里。
+    print("\n--- yosys 引擎 ---")
+    import _yosys
+
+    _yos = _yosys.locate()
+    if _yos is None:
+        # 「没跑」≠「跑了没问题」。这里必须**明说跳过了**，
+        # 不能让整节静默消失 —— 那和"全绿"长得一样（同 lint.ran 的教训）。
+        print("  ⊘ 没找到 yosys，跳过这一节（装法："
+              "python tools/setup_tools.py --install yosys --lock）")
+    else:
+        # ---- 8a. 正例对照：引擎真的生效了吗 ----
+        code, rep = run(str(SMOKE / "fsm_bin.v"), "--engine", "yosys",
+                        "--encoding-compare")
+        check(code == 0, f"yosys 引擎应退出 0，实际 {code}")
+        d = _d(rep)
+        check(rep.get("engine") == "yosys", "engine 字段要如实写 yosys")
+        check(rep.get("n_yosys_ok") == 1, f"n_yosys_ok 应为 1，实际 {rep.get('n_yosys_ok')}")
+        # 两个计数必须分开：iverilog 那条腿的 n_ok / n_sizer_ok 含义不变
+        check(rep.get("n_ok") == 1 and rep.get("n_sizer_ok") == 1,
+              "★ 加了 yosys 那条腿之后，iverilog 那两个计数必须照旧")
+        y = d.get("yosys") or {}
+        check(y.get("ran") is True, f"yosys 该跑成，实际 {y.get('skipped_reason_zh')}")
+        check(y.get("fsm_detected") is True, "fsm_bin 里该认出状态机")
+
+        rows = {r["encoding"]: r for r in ((d.get("encoding_compare") or {}).get("rows") or [])}
+        check(set(rows) == {"auto", "one-hot", "binary"},
+              f"三种编码各要一行，实际 {sorted(rows)}")
+        # ★★ 这一条是整节的锚：**编码真的换出不同硬件**。
+        #   少了它，"引擎压根没生效"和"引擎正常工作"在测试里长得一模一样
+        #   —— 三种编码全给同一份数字，断言照样过。
+        one, bina = rows["one-hot"], rows["binary"]
+        check(one["n_state_bits"] == 4 and bina["n_state_bits"] == 2,
+              f"★ one-hot 该 4 位状态寄存器、binary 该 2 位，实际 "
+              f"{one['n_state_bits']} / {bina['n_state_bits']}")
+        check(isinstance(one["n_cells"], int) and isinstance(bina["n_cells"], int)
+              and one["n_cells"] != bina["n_cells"],
+              f"★ 两种编码的门数必须不同，实际 {one['n_cells']} / {bina['n_cells']}")
+        # 变异：把 build_script 里 `fsm` 那一阶段整段删掉 → 上面两条全红。
+        if rows["auto"]["encoding_used"] != one["encoding_used"] and \
+           rows["auto"]["encoding_used"] != bina["encoding_used"]:
+            check(False, f"auto 的 encoding_used 得是 yosys 报出来那个，"
+                         f"实际 {rows['auto']['encoding_used']!r}")
+        cmp_ = d.get("encoding_compare") or {}
+        check(cmp_.get("comparable") is True and cmp_.get("identical") is False,
+              "状态机认出来了、数字也不同，comparable 该 true、identical 该 false")
+        print(f"  ✓ one-hot {one['n_state_bits']} 位/{one['n_cells']} 门 vs "
+              f"binary {bina['n_state_bits']} 位/{bina['n_cells']} 门，"
+              f"auto 实际挑了 {rows['auto']['encoding_used']}")
+
+        # ---- 8b. ★ 负例：没有状态机时**不许给一张看着像结论的表** ----
+        code, rep = run(str(SMOKE / "dut_counter4.v"), "--engine", "yosys",
+                        "--encoding-compare")
+        d = _d(rep)
+        c = d.get("encoding_compare") or {}
+        check(c.get("comparable") is False,
+              "★ 没有状态机时必须报 comparable=False —— "
+              "三种编码数字相同不是结论，是没比较到东西")
+        # ★ 和 comparable 分开的两位：认出来了但数字相同是**真结论**，
+        #   认不出来是**没法比较**。挤成一位下游就分不清，两者给学习者的
+        #   下一步完全相反。
+        check(c.get("identical") is True,
+              "★ 认不出来时 identical 仍该如实报 true（三次确实一样），"
+              "但它的含义由 comparable 决定 —— 两位不能合并")
+        check(any("没能比较" in n for n in (c.get("notes_zh") or [])),
+              "提示里必须明说「本次没能比较」，而不是把三次相同摆成结论")
+        check(rep.get("n_comparable") == 0, "n_comparable 该是 0")
+        # 用户显式要了对比、一份没比成 → 翻失败（沿用 --netlist 那条先例）
+        check(code != 0, "★ 要了编码对比却一份都没比成，必须判失败")
+        print("  ✓ 纯计数器：comparable=false / identical=true，"
+              "明说「没能比较」，整体判失败")
+
+        # ---- 8c. ★ 负例：非硬件 cell 在场时不许给门数结论 ----
+        code, rep = run(str(SMOKE / "synth_unsynth.v"), "--engine", "yosys")
+        d = _d(rep)
+        y = d.get("yosys") or {}
+        check(code != 0, "★ 含 $display/#延迟 的设计，yosys 引擎该判失败")
+        check(y.get("ran") is True,
+              "★ yosys 会照常跑完（rc=0），所以 ran 该是 true —— "
+              "问题不在「没跑」，在「跑出来的不是硬件」")
+        check("$print" in (y.get("non_hw_cells") or {}),
+              f"★ 该认出 $print，实际 {y.get('non_hw_cells')}")
+        check(y.get("gate_count_meaningful") is False,
+              "★ 非硬件 cell 在场时 gate_count_meaningful 必须 false")
+        check(y.get("ok") is False, "★ 不许判 ok")
+        # 数字照给（它是事实）——但它**必须**带着"不是门数"的标记
+        nd = (y.get("modules") or [{}])[0]
+        check(nd.get("counts", {}).get("cells") == 96,
+              f"实测是 96 个 cell，要如实记下来，实际 "
+              f"{nd.get('counts', {}).get('cells')}")
+        check(any("不能当门数" in n for n in (y.get("notes_zh") or [])),
+              "必须明说这个数字不能当门数")
+        # 变异：把 _NON_HW_PREFIXES 置空 → non_hw_cells 变 {}、上面四条全红。
+        print("  ✓ 96 个 cell 如实记下但标为不可用（non_hw_cells=$print），"
+              "gate_count_meaningful=false")
+
+        # ---- 8d. ★ 两条腿的分歧要挑明，不能只报乐观的那个 ----
+        cc = d.get("cross_check") or {}
+        check(cc.get("kind") == "disagreement",
+              f"★ iverilog 说合不了、yosys 给出数字 —— 必须报成分歧，实际 {cc.get('kind')}")
+        check("gate_count_meaningful" in (cc.get("message_zh") or ""),
+              "分歧说明里要把人引到 yosys 那一侧的可信度字段上")
+        # 反过来：异步复位不是"打架"，是预料之中的边界差异，措辞不能混
+        code, rep = run(str(SMOKE / "fsm_bin.v"), "--engine", "yosys", "--netlist")
+        cc2 = _d(rep).get("cross_check") or {}
+        check(cc2.get("kind") == "yosys_handles_it",
+              f"★ 异步复位该归到 yosys_handles_it（不是 disagreement），实际 {cc2.get('kind')}")
+        check("你的 RTL 没问题" in (cc2.get("message_zh") or ""),
+              "异步复位那一条必须明说 RTL 没问题（和 iverilog 那条腿同一口径）")
+        print("  ✓ 分歧归类：not_synthesizable 对 yosys → disagreement；"
+              "异步复位 → yosys_handles_it（明说 RTL 没问题）")
+
+        # ---- 8e. ★ 负例：「没跑」≠「跑了没报」，且不许动 iverilog 那条腿的结论 ----
+        bad = _yosys.run([SMOKE / "fsm_bin.v"], top="fsm_bin",
+                         exe_hint=WORK / "no_such_dir",
+                         workdir=WORK / "y_badexe")
+        check(bad.ran is False and bad.started is False,
+              "★ exe 指到不存在的路径：ran 和 started 都该是 false")
+        check(bool(bad.skipped_reason_zh) and "setup_tools" in bad.skipped_reason_zh,
+              f"要如实报缺并给出装法，实际 {bad.skipped_reason_zh!r}")
+        # 变异：把 `run()` 里的 `ran` 恒置 True → 上面两条红。
+        # 而**判定一个字不变** —— 和 lint 那条铁律同理：
+        # yosys 没跑成，不能把 iverilog 那条腿已经拿到的数字一起打成失败。
+        code_ref, rep_ref = run(str(SMOKE / "fsm_bin.v"))
+        code_y, rep_y = run(str(SMOKE / "fsm_bin.v"), "--engine", "yosys")
+        check(_totals(rep_ref) == _totals(rep_y),
+              f"★ yosys 那条腿不许改动 iverilog 的数字："
+              f"{_totals(rep_ref)} vs {_totals(rep_y)}")
+        check(rep_ref.get("n_sizer_ok") == rep_y.get("n_sizer_ok"),
+              "n_sizer_ok 逐字段不变")
+        print("  ✓ yosys 缺席时 ran=false + 报缺，iverilog 那条腿的数字逐字段不变")
+
+        # ---- 8f. ★ 硬事实①：空文件 rc=0、日志正常，但一个模块都没有 ----
+        empty = _yosys.run([SMOKE / "synth_empty.v"], workdir=WORK / "y_empty")
+        check(empty.started is True,
+              "★ 空文件时 yosys **确实起来了**（有横幅）—— 不能和「缺 DLL 起不来」混")
+        check(empty.reached_stat is True,
+              "★ 空文件时流水线**确实跑到了 stat**（tee 文件在）")
+        check(empty.ran is False and empty.modules == [],
+              "★ 但没有模块，所以 ran 该是 false、modules 该是空")
+        check("退出码是 0" in (empty.skipped_reason_zh or ""),
+              "理由里必须点破「退出码 0 不算证据」，否则读者会去信 rc")
+        # 变异：把 `ran` 改成只看 stat 文件在不在 → 上面 ran/modules 两条红。
+        print("  ✓ 空文件：started=true / reached_stat=true / ran=false，"
+              "并点破「退出码 0 不算证据」")
+
+        # ---- 8g. gray 必须被明确挡住（不是静默当成 auto）----
+        code, rep = run(str(SMOKE / "fsm_bin.v"), "--engine", "yosys",
+                        "--fsm-encoding", "gray")
+        check(code == 64, f"gray 是非法取值，该退出 64，实际 {code}")
+        print("  ✓ --fsm-encoding gray 被挡下（yosys 的 fsm_recode 只支持 one-hot/binary）")
+
+    # ---- 8h. 用法错误：编码相关开关不能脱离 --engine yosys ----
+    for desc, bad_args in [
+        ("--encoding-compare 没配 --engine yosys",
+         [str(SMOKE / "dut_counter4.v"), "--encoding-compare"]),
+        ("--fsm-encoding 没配 --engine yosys",
+         [str(SMOKE / "dut_counter4.v"), "--fsm-encoding", "binary"]),
+    ]:
+        p = subprocess.run([sys.executable, str(ROOT / "tools" / "synth.py"), *bad_args],
+                           cwd=str(ROOT), capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        check(p.returncode == 64, f"{desc}：应退出 64，实际 {p.returncode}")
+        check(not p.stdout.strip().startswith("{"),
+              f"{desc}：用法错误时不该往 stdout 吐 JSON")
+    print("\n--- 负例：编码开关脱离 --engine yosys ---")
+    print("  ✓ 两条都是 64，且不污染 stdout（不静默换引擎）")
+
+    # ---- 8i. 单元：parse_stat / cell 分类（端到端逼不出边界）----
+    print("\n--- parse_stat / cell 分类 单元 ---")
+    check(_yosys.parse_stat("") == ([], []),
+          "空输入该返回空、不抛异常")
+    check(_yosys.parse_stat("noise\nmore noise\n") == ([], ["noise", "more noise"]),
+          "没有 === 分节时，非空行该进 outside 而不是被静默丢掉")
+    mods, _ = _yosys.parse_stat(
+        "=== m ===\n\n        5 wires\n        3 cells\n"
+        "        2   $_DFF_P_\n        1   $print\n"
+        "   这里是不认识的一行\n"
+    )
+    check(len(mods) == 1 and mods[0].name == "m", f"该解析出 1 个模块，实际 {mods}")
+    check(mods[0].n_cells == 3, f"cells 该是 3，实际 {mods[0].n_cells}")
+    # ★ 寄存器位数取 `$_DFF_*` 的**个数和**，不是 `stat` 的 cell 总数：
+    #   `$adff` 无论状态寄存器多宽都只算一个 cell，拿总数比编码等于没比。
+    check(mods[0].n_state_bits == 2,
+          f"★ 寄存器位该是 $\\_DFF_* 的个数和 = 2，实际 {mods[0].n_state_bits}")
+    check("$print" not in mods[0].seq_cells, "非硬件 cell 不许算进寄存器位")
+    check(_yosys._is_non_hw("$print") and not _yosys._is_non_hw("$_DFF_P_"),
+          "非硬件 cell 的判据要能分开 $print 和 $_DFF_P_")
+    check(_yosys._is_mapped_gate("$_AND_") and not _yosys._is_mapped_gate("$mem"),
+          "门级 cell 的判据：$_XXX_ 才算映射过的门")
+    check(mods[0].unparsed == ["   这里是不认识的一行"],
+          f"不认识的行要留下来，静默丢行和静默丢结构是一类错，实际 {mods[0].unparsed}")
+    print("  ✓ 空输入不抛、未知行进 unparsed、寄存器位只数 $\\_DFF_*")
+
     if fails:
         print(f"\nsynth 检查未通过：{len(fails)} 条断言失败")
         for f in fails:

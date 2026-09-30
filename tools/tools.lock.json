@@ -1,0 +1,38 @@
+{
+  "yosys": {
+    "repo": "YosysHQ/oss-cad-suite-build",
+    "tag": "2026-09-28",
+    "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+    "sha256": "71a0a16592db2070e6abf18f76463dcc6bc0c7d6c772f29a7fd925197a29e184"
+  },
+  "verilator": {
+    "repo": "YosysHQ/oss-cad-suite-build",
+    "tag": "2026-09-28",
+    "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+    "sha256": "71a0a16592db2070e6abf18f76463dcc6bc0c7d6c772f29a7fd925197a29e184"
+  },
+  "oss-utils": {
+    "repo": "YosysHQ/oss-cad-suite-build",
+    "tag": "2026-09-28",
+    "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+    "sha256": "71a0a16592db2070e6abf18f76463dcc6bc0c7d6c772f29a7fd925197a29e184"
+  },
+  "oss-system-resources": {
+    "repo": "YosysHQ/oss-cad-suite-build",
+    "tag": "2026-09-28",
+    "asset": "oss-cad-suite-windows-x64-20260928.tgz",
+    "sha256": "71a0a16592db2070e6abf18f76463dcc6bc0c7d6c772f29a7fd925197a29e184"
+  },
+  "verible": {
+    "repo": "chipsalliance/verible",
+    "tag": "v0.0-4296-g0f262651",
+    "asset": "verible-v0.0-4296-g0f262651-win64.zip",
+    "sha256": "4590841d91dadb108879aa261dbfd7081db06360484a7a21470174bf6fb3cf80"
+  },
+  "mingw": {
+    "repo": "brechtsanders/winlibs_mingw",
+    "tag": "16.2.0posix-14.0.0-ucrt-r1",
+    "asset": "winlibs-x86_64-posix-seh-gcc-16.2.0-mingw-w64ucrt-14.0.0-r1.zip",
+    "sha256": "c1f52294597c0b73786b2a78eb5d176d89226d2f21875eab75e783a8b1cefcc4"
+  }
+}

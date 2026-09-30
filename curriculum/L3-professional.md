@@ -19,22 +19,30 @@
 | 内容 | 本仓库能做到 | 做不到 |
 |---|---|---|
 | RTL 功能设计 | ✅ 完整（iverilog 仿真 + 自动判定） | — |
-| 测试台与验证 | ✅ 完整（自检测试台、随机激励、覆盖率概念） | UVM 类库、商业仿真器特性；代码覆盖率需装 verilator |
+| 测试台与验证 | ✅ 完整（自检测试台、随机激励、覆盖率概念），功能覆盖率的**合并**能跑（`tools/cov.py`，零下载） | UVM 类库、商业仿真器特性；**代码覆盖率（行/翻转）跑不了**——verilator + mingw 都装了，但 verilator 的 C++ 链路本仓库还没接（缺 MAKE / PYTHON3 / 链接三关），所以 `cov.code` 仍是缺口 |
 | 逻辑综合 | ✅ **零下载**的 iverilog `-t blif`（门级网表）/ `-t sizer`（FF 与门数估算）**已接入**（`tools/synth.py`）；✅ **yosys 也已接入**（`--engine yosys`，2026-09-29）——真跑 `proc → opt → fsm → techmap → abc`，出**映射后**的门数，并支持 `--encoding-compare` 让综合器自己挑状态编码（⚠️ 只支持 one-hot / binary，没有 gray） | ❌ 跑不了 DC / Genus，**没有工艺库**，面积/时序不是真实数字（`abc` 用的是内置通用映射，只能横向比） |
 | 静态时序分析 | ⚠️ 只能讲原理 + 手算 slack + 读真实报告样例 | ❌ **Windows 原生无方案**（OpenSTA 需 WSL2）。没有真实 slack |
 | Lint / CDC 检查 | ⚠️ 自带 `_lint.py` 只覆盖锁存器；**verilator 已接入**（`tools/_vlint.py`）可补真 lint（位宽/组合环/多驱动）；⚠️ **verible 装是装在（0.0-4296），但还没有调用它的代码**，编码规范检查**目前跑不了** | ❌ CDC 没有成熟开源工具，只能人工审查 + 形式验证辅助 |
 | 形式验证 | ⚠️ **sby / eqy / z3 已装好且手动跑得通**（实测 sby + `smtbmc z3` 的 k-induction 作业跑出 `DONE (PASS, rc=0)`），**但那是手敲命令行跑的、不是仓库跑的** —— `tools/` 里没有调用它们的入口，所以这一项**在仓库里跑不了** | ❌ 规模和易用性远不如商业工具 |
 | DFT / 低功耗 | ⚠️ 只能讲概念和接口 | ❌ **Windows 原生无方案**。且 L3-14 / L3-13 大纲本来就没承诺动手 |
 
-**装不装由你定，缺工具不阻塞开课。** 跑 `python tools/check_tools.py --level L3` 看这一级缺什么、缺了会怎样、装什么能补，然后 `python tools/setup_tools.py --install <id> --lock` 装到仓库里（不影响系统环境）。
+**装不装由你定，缺工具不阻塞开课。** 跑 `python tools/check_tools.py --level L3` 看这一级缺什么、缺了会怎样、装什么能补，然后 `python tools/setup_tools.py --install <id> --lock` 装到仓库里（不影响系统环境）。想一次装成跟作者一样，用 `python tools/setup_tools.py --restore-lock`——它照 `tools/tools.lock.json` 装，并**顺带告诉你锁盖不到哪里**（`iverilog` 就没 sha256、不在锁里）。
 
 **注意 `verilator` 分两条路，成本差很多**：`--lint-only` 装完即用；`--binary`（真正编译仿真模型，覆盖率、并发断言靠它）需要 C++ 编译器 + `make`。别把「装了 verilator」当成「断言能跑了」。
 
-⚠️ **纠一个容易想当然的地方：这条链的瓶颈是编译器，不是 make。** 实测过了——make 那步可以用 `mingw32-make` 顶替（verilator 认 `MAKE` 环境变量），但本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017 年），而这个 verilator 是按 **GCC 15.2.1** 配置的，之后连撞四个坑：`-fcf-protection=none` 不认（GCC 8+ 才有）、`verilated.mk` 里 `python3` 找不到、`GetProcessMemoryInfo` 缺 `-lpsapi`、最后链接报 `WinMain` 未定义。逐个绕过去也不牢靠。**结论：要打通得换现代 mingw-w64（`mingw` 条目，约 250 MB），补一个 make 解决不了问题。**
+⚠️ **这条链的瓶颈是编译器，不是 make** —— 这句**只对了一半**，2026-09-29 换完编译器之后更正的。先说前半：make 那步确实可以用 `mingw32-make` 顶替（verilator 认 `MAKE` 环境变量）。当时本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017 年），而 verilator 是按 **GCC 15.2.1** 配的，连撞四个坑：`-fcf-protection=none` 不认、`verilated.mk` 里 `python3` 找不到、`GetProcessMemoryInfo` 缺 `-lpsapi`、链接报 `WinMain` 未定义。于是装了现代 mingw-w64（`mingw` 条目）。
+
+**换完之后实测：仍然打不通。** 那个包装完 `found=True` 且 `usable=True`（自检真编过了），但 verilator `--binary` 走到底还是三关：
+
+1. `make` 找不到 → 指 `MAKE` 到 `mingw32-make.exe`，**这关能过**；
+2. `verilated.mk` 里 `PYTHON3 = python3` 是**硬编码**、会盖掉环境变量，而 PATH 上那个 `python3` 是 Windows 商店的占位桩（退出码 49）——得用 make 命令行变量才顶得过去；
+3. 过了前两关，所有 `.cpp` 都编得出来，**最后卡在链接**：`undefined reference to WinMain` + 一串 `std::__cxx11::basic_string<...>::basic_string(...&&)`。
+
+**这三关本仓库一行代码都没写**，所以 `cov.code`（覆盖率）和 `sva.assert`（并发断言）现在**装齐软件也不能动手**——这也是为什么这两条的 `gap` 是 `software+code` 而不是 `software`：标成 `software` 的话，软件一装它们就被判成「可用」，而实际跑不出来。**`mingw` 是清单里性价比最差的一项**：下 261 MB、占 940 MB 磁盘，换来的是「有一个现代 g++」（这一条是真拿到了），覆盖率/断言那两条一点没动。
 
 ⚠️ **OSS CAD Suite 只装整包，不要装分组件**（2026-09-28 实测的分组件，2026-09-29 被整包推翻）。分组件 Windows 资产**不自包含**：`windows-x64-yosys.tgz` 装完，`yosys.exe` 启动即 `STATUS_DLL_NOT_FOUND`——它要 `libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1` 一整组运行时 DLL，而组件里一个都不带。表现是**一个字节输出都没有、也没有报错信息**，只看「文件在不在」必然误判成装好了。
 
-根因不是"缺几个 DLL、补上就行"：整包与分组件带的 `libstdc++-6.dll` 存在 **C 库 ABI 分裂**（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），拿 bleyer iverilog 的同名 DLL 顶上只会把 `STATUS_DLL_NOT_FOUND (0xC0000135)` 换成 `STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)`，**不能混用**。所以清单里 **8 个条目**（yosys / verilator / formal(sby) / eqy / z3 / slang / oss-utils / oss-system-resources）现在统一指向**同一个整包**，`setup_tools.py` 按 `(repo, tag, asset)` 判重，只下一次、只解一次。`verible` 不共这个整包，是 6.9 MB 的独立 zip，装到 `.tools/verible`。
+根因不是"缺几个 DLL、补上就行"：整包与分组件带的 `libstdc++-6.dll` 存在 **C 库 ABI 分裂**（`std::fpos<int>` vs `std::fpos<_Mbstatet>`），拿 bleyer iverilog 的同名 DLL 顶上只会把 `STATUS_DLL_NOT_FOUND (0xC0000135)` 换成 `STATUS_ENTRYPOINT_NOT_FOUND (0xC0000139)`，**不能混用**。所以清单里 **8 个条目**（yosys / verilator / formal(sby) / eqy / z3 / slang / oss-utils / oss-system-resources）现在统一指向**同一个整包**，`setup_tools.py` 按 `(repo, tag, asset)` 判重，只下一次、只解一次。**不共这个整包的是 `verible`（6.9 MB 独立 zip → `.tools/verible`）和 `mingw`（261 MB zip → `.tools/mingw`，解开后 940 MB）**。
 
 整包（572 MB）**已实测全部能用**：`yosys 0.69+154`、`verilator_bin 5.053`、`z3 4.15.5`、`sby` / `eqy` / `slang 11.0.448` / `gtkwave 4.0.0` 逐一起得来，形式验证真跑通了一个 k-induction 作业。代价是 `.tools/oss` 占 **2.1 GB**。`check_tools.py` 的判据是 `found and usable`（真跑一次功能自检），所以「文件在」不会被当成「能用」。
 
@@ -42,9 +50,11 @@
 `yosys` / `sby` / `eqy` / `z3` 装好了，**但 `tools/` 里调用它们的代码一度一处都没有**——
 `sta.estimate`、`cdc.formal`、`formal.prop`、`formal.lec` 这四条能力因此标着
 `gap: "software+code"`（缺的是**接入代码**）。同理 `lint.style` 要的 verible 也装好了，
-缺的同样是接入代码。**现在的 L3 可用数是 6/19，不是 11/19**——那 5 条虚高是
+缺的同样是接入代码。**现在的 L3 可用数是 7/19，不是 11/19**——那几条虚高是
 「软件一装就报可用、而 integration 里自己写着仓库有活干」造成的。
 要真正拿它们上课，得先按 `integration` 字段写接入代码。
+（★ 数字变过两次：先 6/19，2026-09-29 装了 mingw 后一度报 8/19，其中 `toolchain.cc`
+是真涨的、`sva.assert` 是假的，把后者改回 `software+code` 之后落在 **7/19**。）
 
 ✅ **2026-09-29 接入的是另一块，这四条一条都没动**：`tools/_yosys.py` 立起来了
 （定位 / 运行 / `stat` 解析 / 失败归类 / 非硬件 cell 检测），**合成那条腿**

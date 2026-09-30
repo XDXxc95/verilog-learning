@@ -1175,6 +1175,59 @@ with tempfile.TemporaryDirectory() as td:
     finally:
         ST.LOCK_PATH = real_lock_path
 
+# ---------------------------------------------------------------- 负例 9e2：锁从 .tools/ 搬进库
+#
+# 2026-09-29 之前锁在 `.tools/tools.lock.json`，而 .gitignore 忽略整个 `.tools/`
+# —— 于是**锁从来没进过库**。新克隆的人手里没锁 → _lock_problem 查不到 entry
+# 就 return None（"第一次装，天经地义"）→ 每次安装都放行。
+# **两边都报「安装成功」，一边真被保护、一边没有。**
+#
+# 搬到 tools/ 之后要有一次迁移，否则**已经在用的人**会从"受保护"悄悄退回
+# "没保护"，而且看不出任何变化 —— 升级路径上的静默退化比一开始就没有更坏。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    real_lock_path = ST.LOCK_PATH
+    real_legacy = ST._LEGACY_LOCK_PATH
+    ST.LOCK_PATH = tmp / "new" / "tools.lock.json"
+    ST._LEGACY_LOCK_PATH = tmp / "old" / "tools.lock.json"
+    try:
+        # ① 两边都没有 → 不搬，也不许凭空造一个空文件出来
+        #    （造了的话 --verify-lock 会说"锁里一条记录都没有"，看着像坏了）
+        check(ST._migrate_legacy_lock(verbose=False) is False, "没有旧锁却报了迁移")
+        check(not ST.LOCK_PATH.exists(),
+              "旧锁不存在却凭空造了个新锁文件——空锁会被读成「校验全过」")
+
+        # ② 只有旧锁 → 内容**逐字**搬过来
+        ST._LEGACY_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"yosys": {"repo": "R", "tag": "T", "asset": "a.tgz", "sha256": "a" * 64}}
+        ST._LEGACY_LOCK_PATH.write_text(json.dumps(payload), encoding="utf-8")
+        check(ST._migrate_legacy_lock(verbose=False) is True, "有旧锁却没有迁移")
+        check(json.loads(ST.LOCK_PATH.read_text(encoding="utf-8")) == payload,
+              "迁移后的内容和旧锁对不上")
+
+        # ③ ★ 两边都有 → **以新的为准**，绝不让旧锁盖掉入库的那份。
+        #    写反了就会：已经在用的人本机那把旧锁，把他从 git 拉下来的新锁覆盖掉，
+        #    而两把锁内容不同时，覆盖是静默的。
+        ST.LOCK_PATH.write_text(json.dumps({"keeper": payload["yosys"]}), encoding="utf-8")
+        check(ST._migrate_legacy_lock(verbose=False) is False, "两边都有锁时还是搬了")
+        kept = json.loads(ST.LOCK_PATH.read_text(encoding="utf-8"))
+        check("keeper" in kept and "yosys" not in kept,
+              f"旧锁把入库的锁盖掉了：{kept}")
+
+        # ④ 旧锁是坏 JSON → 不搬，且**要说出来**（静默跳过 = 用户不知道自己没锁）
+        ST.LOCK_PATH.unlink()
+        ST._LEGACY_LOCK_PATH.write_text("{ 这不是 JSON", encoding="utf-8")
+        errbuf = io.StringIO()
+        with contextlib.redirect_stderr(errbuf):
+            got = ST._migrate_legacy_lock(verbose=False)
+        check(got is False, "旧锁是坏 JSON 却报了迁移成功")
+        check(not ST.LOCK_PATH.exists(), "旧锁坏了却造出一个新锁文件")
+        check("警告" in errbuf.getvalue(),
+              "旧锁坏了被静默跳过——用户会以为自己还有锁")
+    finally:
+        ST.LOCK_PATH = real_lock_path
+        ST._LEGACY_LOCK_PATH = real_legacy
+
 # ---------------------------------------------------------------- 负例 9f：「已安装」短路
 #
 # 原先每次 install_one 都完整解压一遍：2026-09-29 跑 --install yosys --lock
@@ -1223,6 +1276,186 @@ with tempfile.TemporaryDirectory() as td:
         check(skip is False, "安装目录都不存在却短路了")
     finally:
         ST.probe = real_probe
+
+# ---------------------------------------------------------------- 负例 9h：--restore-lock
+#
+# 「照锁还原环境」这条命令的价值不在于它装了什么，**在于它明说自己装不了什么**。
+# 锁只覆盖「有 source.asset 且加过 --lock」的那些；iverilog 走另一个安装器、
+# 没有 sha256、根本不在锁里 —— 所以还原出来的环境**不一定和作者一致**。
+# 印一句「环境已还原」而实际差着 iverilog，就是本仓库最防的那种谎。
+#
+# 这里要守住四件事，每一件都有对应的变异能把它弄红：
+#   ① 锁是空的时候不许说「完成」          （变异：把空锁分支删掉）
+#   ② 覆盖按**资产**判、不按 id            （变异：改成按 id 判 → b_suite 变假缺口）
+#   ③ 没有 sha256 的条目不算覆盖           （变异：_locked_assets 去掉 sha256 过滤）
+#   ④ 没 source 的条目必须进「不归锁管」桶 （变异：恢复成按 install.method 过滤，
+#                                            → 恰好漏掉 iverilog。第一版就是这么错的）
+# 外加一条方向断言：还原时**不许写锁**（变异：把 lock=False 改成 True）。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    syn = _minimal(software=[
+        # a / b 共用同一个归档 —— 锁里只记了 a 时，b 必须也算被覆盖
+        {"id": "a_suite", "name": "A套件", "summary": "", "windows": "native",
+         "source": {"type": "github-release-asset", "repo": "R", "tag": "T",
+                    "asset": "shared.tgz"},
+         "install": {"method": "extract-tgz", "dest": ".tools/oss"}},
+        {"id": "b_suite", "name": "B套件", "summary": "", "windows": "native",
+         "source": {"type": "github-release-asset", "repo": "R", "tag": "T",
+                    "asset": "shared.tgz"},
+         "install": {"method": "extract-tgz", "dest": ".tools/oss"}},
+        {"id": "c_other", "name": "C独立包", "summary": "", "windows": "native",
+         "source": {"type": "github-release-asset", "repo": "R", "tag": "T",
+                    "asset": "own.zip"},
+         "install": {"method": "extract-zip", "dest": ".tools/c"}},
+        # ★ iverilog 在真清单里的形状：**既没有 source 也没有 install 段**
+        #   （它由 setup_toolchain.py 单独装）。这一格就是 ④ 的现场。
+        {"id": "ivi", "name": "iverilog", "summary": "", "windows": "native"},
+        {"id": "wslly", "name": "WSL专属", "summary": "", "windows": "wsl-only",
+         "install": {"method": "wsl-apt"}},
+        {"id": "venvish", "name": "venv工具", "summary": "", "windows": "pip",
+         "install": {"method": "venv-pip"}},
+    ])
+    man = M.load(_write(tmp, syn))
+    real_lock_path, real_install = ST.LOCK_PATH, ST.do_install
+    real_verify = ST.do_verify_lock
+    ST.LOCK_PATH = tmp / "tools.lock.json"
+    install_calls: list[tuple[list[str], bool]] = []
+    ST.do_install = lambda m, ids, verbose, lock, force=False: (
+        install_calls.append((list(ids), lock)), ST.EXIT_OK)[1]
+    # 末尾那次核对单独由负例 9i 管；这一节要测的是**覆盖面的判据**，
+    # 让它去碰真 CACHE_DIR 只会引入无关噪声（真缓存里没有 shared.tgz）。
+    ST.do_verify_lock = lambda m: ST.EXIT_OK
+    try:
+        def _run() -> tuple[int, str, str]:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = ST.do_restore_lock(man, verbose=False)
+            return rc, out.getvalue(), err.getvalue()
+
+        # ① 空锁：**必须报缺**，而且绝不能印「完成：N 条按锁还原」。
+        #    空锁 → 「没什么可还原」和「还原成功」在下游长得一样，含义相反。
+        rc, out, err = _run()
+        check(rc == ST.EXIT_ENV, f"锁是空的却没报缺（rc={rc}）")
+        check("完成" not in out,
+              f"空锁却印了「完成」—— 拿「没东西可还原」冒充「还原成功」：{out!r}")
+        check("没有可还原的东西" in out + err, "空锁没说清是「没东西」而不是「已还原」")
+        check(install_calls == [], "锁是空的却还是去装了东西")
+
+        def _write_lock(data: dict) -> None:
+            ST.LOCK_PATH.write_text(json.dumps(data), encoding="utf-8")
+
+        # ② 覆盖按资产判：shared.tgz 锁过 → a_suite 和 b_suite 都算覆盖，
+        #    报成缺口就是凭空造一个不存在的洞。
+        _write_lock({
+            "a_suite": {"repo": "R", "tag": "T", "asset": "shared.tgz", "sha256": "a" * 64},
+            "c_other": {"repo": "R", "tag": "T", "asset": "own.zip", "sha256": "b" * 64},
+        })
+        rc, out, err = _run()
+        check(rc == ST.EXIT_OK, f"锁正常却报错（rc={rc}）")
+        check("没进锁" not in out,
+              f"共用同一归档的条目被报成了假缺口（按 id 而不是按资产判）：{out!r}")
+        # ④ 没有 source 的条目**必须在「不归锁管」桶里**，哪怕锁是全的
+        check("由 setup_toolchain.py 单独装" in out,
+              f"iverilog 形状的条目没被报出来 —— 环境差着判定内核的编译器却一声不吭：{out!r}")
+        check("wslly" not in out and "WSL2 专属" in out,
+              f"WSL 专属条目混进了缺口桶（它压根不在 Windows 上装）：{out!r}")
+
+        # ⑤ 方向断言：还原时**不许写锁**。写了就把「参照物」变成「本次结果」，
+        #    锁也就不再是锁 —— 下次校验拿自己刚下的一份跟自己比，永远通过。
+        check(install_calls and all(lock is False for _, lock in install_calls),
+              f"还原时把锁写了 —— 参照物被换成本次结果：{install_calls}")
+
+        # ③ 锁里那条没有 sha256 → 不算覆盖。没有这个过滤，「记了个空壳」
+        #    也会被当成「锁住了」，而实际什么都没锁住。
+        _write_lock({
+            "a_suite": {"repo": "R", "tag": "T", "asset": "shared.tgz", "sha256": "a" * 64},
+            "c_other": {"repo": "R", "tag": "T", "asset": "own.zip"},
+        })
+        rc, out, err = _run()
+        check("own.zip 没进锁" in out,
+              f"锁里那条没 sha256 却被当成覆盖了：{out!r}")
+        check("shared.tgz 没进锁" not in out,
+              f"有 sha256 的那条被误报成缺口：{out!r}")
+    finally:
+        ST.LOCK_PATH = real_lock_path
+        ST.do_install = real_install
+        ST.do_verify_lock = real_verify
+
+# ---------------------------------------------------------------- 负例 9i：还原的凭据是核对，不是安装
+#
+# 2026-09-29 实测抓到的谎：把锁里 yosys 的 sha256 改成 64 个 0，
+#   `--verify-lock` 正确报「不一致 1」，
+#   `--restore-lock` 却照样印「完成：6 条按锁还原」——**同一把锁，两个答案**。
+# 根因：`install_one` 里 `_already_installed` 短路在 `_lock_problem` **之前**，
+# 所以在一台装好的机器上，「已装」的条目**一次都没碰过锁**，`do_install` 的
+# 返回值只说明「装的过程没报错」，说明不了「装出来的东西和锁里的一样」。
+#
+# 这一节守住两件事：
+#   ① `do_restore_lock` **必须**调用 `do_verify_lock`，且在 `do_install` 之后
+#      （变异：把核对那一段删掉 → 序里没有 verify，且下面 ② 也变红）
+#   ② 核对红时**不许印「还原完成」**，必须换成实话并返回红
+#      （变异：把 `if verify_rc != EXIT_OK: return verify_rc` 改成恒真短路）
+# 外加正向对照：核对绿时才允许说「还原完成」，且要带上「新下 N / 复用已装 M」
+# 这个分区 —— 少了它，「核对的是哪一批」就无从判断（同「两个计数必须分开报」）。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    syn = _minimal(software=[
+        {"id": "a_suite", "name": "A套件", "summary": "", "windows": "native",
+         "source": {"type": "github-release-asset", "repo": "R", "tag": "T",
+                    "asset": "shared.tgz"},
+         "install": {"method": "extract-tgz", "dest": ".tools/oss"}},
+        {"id": "b_suite", "name": "B套件", "summary": "", "windows": "native",
+         "source": {"type": "github-release-asset", "repo": "R", "tag": "T",
+                    "asset": "shared.tgz"},
+         "install": {"method": "extract-tgz", "dest": ".tools/oss"}},
+    ])
+    man = M.load(_write(tmp, syn))
+    real_lock_path, real_install, real_verify = (
+        ST.LOCK_PATH, ST.do_install, ST.do_verify_lock)
+    ST.LOCK_PATH = tmp / "tools.lock.json"
+    ST.LOCK_PATH.write_text(json.dumps({
+        "a_suite": {"repo": "R", "tag": "T", "asset": "shared.tgz", "sha256": "a" * 64},
+        "b_suite": {"repo": "R", "tag": "T", "asset": "shared.tgz", "sha256": "a" * 64},
+    }), encoding="utf-8")
+    order: list[str] = []
+    # ★ 两个都已装 —— 正是出问题的那台机器。do_install 在这里是**空转**的，
+    #   所以它的返回值只为绿只证明「装的过程没报错」，这正是当初被误当成凭据的东西。
+    ST.do_install = lambda m, ids, verbose, lock, force=False: (
+        order.append("install"), ST.EXIT_OK)[1]
+    try:
+        def _run(vrc: int) -> tuple[int, str, str]:
+            order.clear()
+            ST.do_verify_lock = lambda m: (order.append("verify"), vrc)[1]
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = ST.do_restore_lock(man, verbose=False)
+            return rc, out.getvalue(), err.getvalue()
+
+        # ① 顺序：先装后核。反过来（先核后装）核的是**装之前**的缓存，
+        #    新下的那批一条都盖不到，等于没核。
+        rc, out, err = _run(ST.EXIT_OK)
+        check(order == ["install", "verify"],
+              f"还原没有先装后核 —— 「照锁还原」没有凭据（实际调用序 {order}）")
+        # ② 正向对照：核对绿时才有资格说「还原完成」，且要报出分区。
+        check(rc == ST.EXIT_OK, f"核对通过却报错（rc={rc}）")
+        check("还原完成" in out,
+              f"核对通过了却不敢说「还原完成」：{out!r}")
+        check("复用已装" in out,
+              f"报告里没把「新下」和「复用已装」分开 —— 核对的是哪一批无从判断：{out!r}")
+
+        # ③ 核对红 → 绝不能印「还原完成」。这正是实测那次：do_install 全绿、
+        #    核对报「不一致 1」，而旧版照样印完成。
+        rc, out, err = _run(ST.EXIT_FAIL)
+        check(rc == ST.EXIT_FAIL,
+              f"核对不一致却返回绿（rc={rc}）—— 装的过程没报错被当成了凭据")
+        check("还原完成" not in out,
+              f"核对没过却印了「还原完成」—— 同一把锁两个答案：{out!r}")
+        check("核对没过" in out + err,
+              f"核对没过却没说清为什么：{out!r} + {err!r}")
+    finally:
+        ST.LOCK_PATH = real_lock_path
+        ST.do_install = real_install
+        ST.do_verify_lock = real_verify
 
 # ---------------------------------------------------------------- 负例 9g：首次安装时目标目录不存在
 #

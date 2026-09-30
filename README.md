@@ -123,6 +123,8 @@ solutions/L1-05/decoder3_8.v       参考答案
 | **按级别体检工具能力** | `python tools/check_tools.py --level L2` |
 | 看清单里有什么工具、装没装 | `python tools/setup_tools.py --list` |
 | 装某个工具（进 `.tools/`） | `python tools/setup_tools.py --install yosys verilator --lock` |
+| **核对工具和作者那边是不是同一份** | `python tools/setup_tools.py --verify-lock` |
+| **照锁还原成作者那套环境**（拉下代码后跑这个） | `python tools/setup_tools.py --restore-lock` |
 | 工具链自检（改过工具就跑） | `python tests/_smoke/run_smoke.py` |
 
 > **学到哪一级，工具就配到哪一级。** 仓库不预先装一大堆——L1 只需要 iverilog（已装），
@@ -265,6 +267,16 @@ python tools/setup_toolchain.py --selftest   # 装完编译+仿真跑一遍验�
 
 当前已装：Icarus Verilog 14.0 + GTKWave 3.3.128。波形默认用生成的 HTML 看，GTKWave 备用。
 
+> **二进制不进库，锁进库。** `.tools/`（约 4.0 GB）整个被 `.gitignore` 忽略，
+> 但 `tools/tools.lock.json` **是入库的**——它记着每个归档的 sha256，是
+> 「你这台机器和作者那台装的是不是同一份」的唯一依据。装完跑一次
+> `python tools/setup_tools.py --verify-lock` 核对。锁对不上时安装会被**拒绝**
+> 而不是装完再警告。详见 [`tools/README.md`](tools/README.md) 的「判题环境怎么保证一致」。
+>
+> 拉下代码后想一次把环境弄成作者那样，跑 `python tools/setup_tools.py --restore-lock`。
+> 它会**顺带告诉你锁盖不到哪里**——`iverilog` 就没有 sha256、不在锁里，
+> 这条命令会明确点出来，而不是让你以为环境已经一模一样。
+
 ---
 
 ## 两个阶段与分支
@@ -298,11 +310,15 @@ python tools/setup_toolchain.py --selftest   # 装完编译+仿真跑一遍验�
   `toggle.py`（状态寄存器逐位翻转计数，量的是**编码代价的另一半**——
   综合器不做活动性分析，这一半只有仿真知道）。
   **都不需要额外装任何东西**，对应的能力项因此是 `gap: "none"`。见 [`tools/README.md`](tools/README.md)
-- ⚠️ **工具清单里有 6 项「缺代码」** —— `cov.code`、`lint.style`、`sta.estimate`、
-  `cdc.formal`、`formal.prop`、`formal.lec`，标着 `gap: "software+code"`：它们要的
-  软件（verilator + mingw / verible / yosys / sby / eqy / z3）**都已经装好了**，
+- ⚠️ **工具清单里有 7 项「缺代码」** —— `cov.code`、`lint.style`、`sta.estimate`、
+  `sva.assert`、`cdc.formal`、`formal.prop`、`formal.lec`，标着 `gap: "software+code"`：
+  它们要的软件（verilator + mingw / verible / yosys / sby / eqy / z3）**都已经装好了**，
   缺的是**本仓库自己的接入代码**，所以装软件并不改变它们的状态。
-  ⚠️ 这 6 条里有 5 条的 `gap` 原先写的是 `software`，且 `integration` 里自己写着
+  ⚠️ 这 7 条里有 6 条的 `gap` 原先写的是 `software`，且 `integration` 里自己写着
   「仓库有活干」——**软件一装，`check_tools` 就把它们报成可用**，L3 的可用数因此
-  虚高到 11/19（真实是 6/19）。2026-09-29 更正。其余 19 项不是 `none` 就是 `software`
+  虚高到 11/19（真实是 6/19）。2026-09-29 更正。其余各项不是 `none` 就是 `software`。
+  ★ **`sva.assert` 是后补的第 7 条，也是活生生的复现**：它那次没被找出来，因为当时
+  `mingw` 还没装，读起来只是「要装 verilator + mingw」。**等 mingw 真装上的那一刻，
+  它立刻被判成可用，而实测 verilator 的 C++ 链路三关一关都没过**——所以现在 L3
+  可用数是 **7/19**（`toolchain.cc` 那条是真涨的：本仓库终于有个能用的现代 g++ 了）
 - ⬜ **开始学习** —— 等明确指令，届时**先新建学习分支**，再选级别

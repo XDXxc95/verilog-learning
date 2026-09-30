@@ -20,6 +20,12 @@
 ⚠️ 关于可复现性：OSS CAD Suite 的 bucket-* 是**滚动 tag**，同名资产每天被覆盖。
    今天装的 yosys 和明天装的可能不是同一个版本。要固定版本必须用 --lock 记下
    sha256，之后靠它校验。不带 --lock 的安装等于"装到哪个算哪个"。
+
+★ 锁写在 **tools/tools.lock.json**（入库，跟着 git 走），不是 `.tools/` 里。
+   这是 2026-09-29 改的：旧位置 `.tools/tools.lock.json` 被 .gitignore 忽略，
+   于是锁**从来没进过库**——作者这台机器受锁保护，别人克隆下来手里没锁，
+   `_lock_problem` 查不到记录就一律放行，**两边都报"安装成功"**。
+   判断"判题环境一致"靠的就是这把锁，它必须在库里。
 """
 
 from __future__ import annotations
@@ -58,8 +64,23 @@ CHUNK = 256 * 1024
 
 # 下载缓存目录（与 setup_toolchain.py 共用 .tools/_cache）
 CACHE_DIR = repo_root() / ".tools" / "_cache"
-# 锁定文件：记录装过的版本与 sha256
-LOCK_PATH = repo_root() / ".tools" / "tools.lock.json"
+
+# 锁定文件：记录装过的版本与 sha256。
+#
+# ★ 它**必须放在入库的路径下**，不能跟其他东西一起待在 `.tools/` 里。
+# 2026-09-29 之前它在 `.tools/tools.lock.json`，而 `.gitignore` 忽略整个
+# `.tools/` —— 于是**锁本身从来没有进过库**。后果不是"少了一份文件"，是
+# 锁对作者生效、对别人不生效：新克隆的人手里没有锁，`_lock_problem` 查不到
+# entry 就 `return None`（"第一次装，天经地义"），每次安装都放行。
+# **两边都报「安装成功」，一边真被保护、一边没有** —— 正是本仓库反复在防的
+# 那类谎，而且它长得跟正常一模一样。
+#
+# 放在 tools/ 下的理由：它描述的是 `tools/toolchain.json` 里那批下载源，
+# 跟清单是同一件事的两面，理应挨着；且 `tools/` 本来就在版本控制里。
+LOCK_PATH = repo_root() / "tools" / "tools.lock.json"
+
+# 旧位置。只给 `_migrate_legacy_lock()` 用一次，之后可以删掉这段。
+_LEGACY_LOCK_PATH = repo_root() / ".tools" / "tools.lock.json"
 
 
 def _gh_url(src: dict) -> str:
@@ -568,6 +589,42 @@ def _read_lock() -> dict:
     return data
 
 
+def _migrate_legacy_lock(verbose: bool = True) -> bool:
+    """把旧位置（`.tools/tools.lock.json`）的锁搬到入库的 `tools/` 下。搬了返回 True。
+
+    ★ 为什么要有这一步：锁从 `.tools/` 搬到 `tools/` 那天，**已经在用的人**
+    （包括作者这台机器）手里的锁还在旧位置。不搬的话，新路径读不到东西 →
+    校验全部静默放行 → 他们从"受保护"悄悄退回"没保护"，而且**看不出任何变化**。
+    升级路径上的静默退化，比一开始就没有更坏：人会以为保护还在。
+
+    只在**新位置还没有文件**时才搬。两边都有的话以新的为准——那份是入库的、
+    大家共用的，旧的只是本机残留。
+    """
+    if LOCK_PATH.exists() or not _LEGACY_LOCK_PATH.is_file():
+        return False
+    try:
+        data = json.loads(_LEGACY_LOCK_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"  [警告] 旧锁 {_LEGACY_LOCK_PATH} 不是合法 JSON（{exc}），没有搬。"
+              f"它会继续被忽略——要锁定请重新用 --lock 装一次。", file=sys.stderr)
+        return False
+    if not isinstance(data, dict):
+        print(f"  [警告] 旧锁 {_LEGACY_LOCK_PATH} 顶层不是对象，没有搬。", file=sys.stderr)
+        return False
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_PATH.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
+    if verbose:
+        print(f"  [迁移] 锁从 {_LEGACY_LOCK_PATH.name} 搬到 {LOCK_PATH}（{len(data)} 条）"
+              f"—— 旧文件留在原地不动，可以自己删。\n"
+              f"         搬的理由：旧位置在 .tools/ 里，被 .gitignore 忽略，"
+              f"所以那把锁**从来没进过库**，别人克隆下来是没锁的。")
+    return True
+
+
 def _lock_problem(sid: str, src: dict, digest: str) -> str | None:
     """比对锁记录与这次实算的 sha256。返回问题描述；没问题或没记录返回 None。
 
@@ -606,7 +663,13 @@ def _write_lock(sid: str, src: dict, digest: str) -> None:
         "sha256": digest,
     }
     LOCK_PATH.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+        # ★ 必须显式指定。默认 newline=None 会把 \n 翻成 \r\n，而这个文件是
+        #   入库的 —— 同一把锁在 Windows 上写出来带 CRLF、在 Linux 上不带，
+        #   每次跨平台 --lock 都会产生一份「整个文件都改了」的假 diff。
+        #   （toolchain.json 那次整文件 diff 就是这么来的。）
+        newline="\n",
     )
     print(f"  [锁定] {sid} sha256={digest[:16]}… 记入 {LOCK_PATH.name}")
 
@@ -782,6 +845,150 @@ def do_for_level(manifest, level: str, verbose: bool, lock: bool,
     return do_install(manifest, ids, verbose, lock, force)
 
 
+def _locked_assets() -> set[str]:
+    """锁里出现过（且记了 sha256）的归档名。**按资产不按 id** 判覆盖。
+
+    ★ 为什么不能按 id 判：整包那次之后，8 个条目共用同一个 tgz，而锁里只会
+    留下其中几个（谁加过 --lock 是谁）。按 id 判的话，formal / eqy / z3 / slang
+    会被报成「没锁」—— 可它们的文件跟 yosys 是**同一份**，已经被锁住了。
+    报成缺口就是凭空造一个不存在的洞，跟漏报一个真实的洞一样坏。
+    """
+    return {
+        e["asset"]
+        for e in _read_lock().values()
+        if isinstance(e, dict) and e.get("asset") and e.get("sha256")
+    }
+
+
+def do_restore_lock(manifest, verbose: bool, force: bool = False) -> int:
+    """照 tools/tools.lock.json 把软件装回来 —— 「还原成跟作者一致的那一套」。
+
+    ★ 为什么单开一条命令，而不是让人照着锁一条条 --install：
+      `--for-level L2` 装的是「L2 需要什么」，`--install X` 装的是「我要 X」。
+      两者都不是「**装成锁里记的那一份**」。前者随清单变动而变，后者靠人眼抄 id
+      —— 抄漏一条，环境就悄悄不一致了，而且**两边都看不出来**
+      （跟锁躺在 .tools/ 里那次的失效方式一模一样）。
+
+    ★ 这条命令最要紧的不是它装了什么，是它**明说自己装不了什么**。
+      锁覆盖的只有「有 source.asset 且加过 --lock」的那些；iverilog 走的是
+      另一个安装器（setup_toolchain.py），**没有 sha256、根本不在锁里**。
+      所以还原完的环境**不一定和作者一致**。差在哪必须印出来 ——
+      印一句「环境已还原」而实际差着 iverilog，正是本仓库最防的那种谎。
+
+    ★ 还原时**不写锁**（`lock=False`）。这条命令的方向是「照锁装」；顺手把这次
+      下载的 sha256 记进去，就把「参照物」变成「本次结果」了，锁也就不再是锁。
+      `--force` 是唯一的例外，那条路本来就明说了要覆盖。
+
+    ★ **`do_install` 对「已装」的条目会短路，而短路发生在锁校验之前**
+      （`install_one` 里 `_already_installed` 在前、`_lock_problem` 在后），
+      所以只用 `do_install` 的话，**本来就装着的那几条一次都不会碰锁** ——
+      在一台装好的机器上，「N 条按锁还原」这句话**一条都没核对过**。
+      2026-09-29 实测抓到：把锁里 yosys 的 sha256 改成 64 个 0，
+      `--verify-lock` 正确报「不一致 1」，`--restore-lock` 却照样印「完成：6 条按锁还原」。
+      **所以这条命令末尾必须补一次 `do_verify_lock`** —— 那才是「还原」这两个字的凭据。
+      这就是本仓库那条「两个计数必须分开报」：新下的条数 ≠ 已装且没核对的条数。
+    """
+    data = _read_lock()
+    if not data:
+        print(
+            f"{LOCK_PATH} 里一条记录都没有 —— **没有可还原的东西**。\n"
+            f"这不是「环境已还原」，是这把锁是空的。\n"
+            f"（要么还没人加过 --lock，要么文件没跟着 git 拉下来；"
+            f"确认它在库里：git ls-files {LOCK_PATH.name}）",
+            file=sys.stderr,
+        )
+        return EXIT_ENV
+
+    by_id = {s.id: s for s in manifest.software}
+    known = [i for i in sorted(data) if i in by_id]
+    stale = [i for i in sorted(data) if i not in by_id]
+
+    print(f"照 {LOCK_PATH.name} 还原（锁里 {len(data)} 条，清单认得 {len(known)} 条）")
+    if stale:
+        print(f"  [警告] 锁里有、清单里没有的 id：{', '.join(stale)} —— 跳过。"
+              f"多半是清单改过名字，这把锁比清单旧了。")
+
+    # 先分区，好在报告里把「新下的」和「本来就装着的」分开说 ——
+    # 后者的下载流程会短路，**锁校验根本不会执行**（见 docstring 里那条实测）。
+    already: list[str] = [i for i in known if _already_installed(by_id[i])[0]]
+    n_fresh = len(known) - len(already)
+
+    rc = do_install(manifest, known, verbose, lock=False, force=force)
+
+    # ---- ★ 补一次锁核对 ----------------------------------------------------
+    # 这一步**不是可选的**。只跑 do_install 的话，已装的条目短路、锁一次没查，
+    # 「照锁还原」就成了一句没有依据的话。do_verify_lock 拿缓存里的归档重算
+    # sha256 和锁对，才是这条命令的凭据；它同时覆盖了刚才短路掉的那些。
+    print(f"\n{'─' * 60}\n核对（新下 {n_fresh} 条，本来就装着 {len(already)} 条"
+          f"——后者的下载流程碰不到锁，全靠这一次）\n")
+    verify_rc = do_verify_lock(manifest)
+
+    # ---- 还原完，把「这次没盖到的地方」摊开说 ----------------------------
+    locked_assets = _locked_assets()
+    uncovered: list[tuple[str, str]] = []   # (id, 为什么没盖到)
+    manual: list[tuple[str, str]] = []
+    n_wsl = 0
+    for s in manifest.software:
+        if s.raw.get("windows") == "wsl-only":
+            n_wsl += 1
+            continue
+        src = s.raw.get("source", {})
+        if not src.get("asset"):
+            # ★ 这里**不能**拿 install.method 做过滤条件。iverilog 在清单里
+            #   压根没有 install 段（它由 setup_toolchain.py 单独装），
+            #   一带过滤就恰好把最该说的那条漏掉了 —— 第一版就是这么写的，
+            #   结果报告里只有 cocotb，iverilog 一个字都没有。
+            method = s.raw.get("install", {}).get("method")
+            if method == "venv-pip":
+                why = "装进仓库私有 venv（pip），没有可锁的归档"
+            elif method:
+                why = f"安装方式是 {method}，没有可锁的归档"
+            else:
+                why = "由 setup_toolchain.py 单独装（Inno Setup 包），**没有 sha256**"
+            manual.append((s.id, why))
+            continue
+        if src["asset"] not in locked_assets:
+            uncovered.append((s.id, f"{src['asset']} 没进锁"))
+
+    print(f"\n{'─' * 60}")
+    if not uncovered and not manual:
+        print("锁覆盖到了清单里所有能锁的条目 —— 就版本一致性而言，这次还原是完整的。")
+    else:
+        # ★ 这两个桶必须分开印。「不归这把锁管」是设计如此，
+        #   「没进锁」是缺口，混在一起会让人以为 iverilog 也是个待补的洞。
+        if uncovered:
+            print(f"⚠ 这些**能锁但没锁**，本次还原出来的版本可能与作者不同（{len(uncovered)} 条）：")
+            for sid, why in uncovered:
+                print(f"    {sid:24} {why}")
+            print("  要补齐：在作者那台机器上 --install <id> --lock，把锁提交进库。")
+        if manual:
+            print(f"\nℹ 这些不归这把锁管，得单独装（{len(manual)} 条）：")
+            for sid, why in manual:
+                print(f"    {sid:24} {why}")
+            if any(sid == "iverilog" for sid, _ in manual):
+                print("  ★ 以上**最要紧的是 iverilog**：它是判定内核 sim.py 用的编译器，"
+                      "L1 起唯一依赖，\n"
+                      "    而 `INSTALLER_CANDIDATES` 在 v14 下不到时会**静默回退 v12(2022)**。\n"
+                      "    也就是说这条还原出来的环境，判题版本可能和作者不同。"
+                      "装完自己确认一眼：")
+                print("      python tools/setup_toolchain.py   然后  .tools/iverilog/bin/iverilog -V")
+        if n_wsl:
+            print(f"\n（另有 {n_wsl} 条是 WSL2 专属，Windows 原生装不了，未计入上面两桶）")
+
+    if rc != EXIT_OK:
+        return rc
+    if verify_rc != EXIT_OK:
+        # 核对没过时**绝不说「还原完成」**。环境是不是作者那套，唯一凭据就是这次核对；
+        # 它红了说明同名资产内容变了（滚动 tag）或下载被篡改/截断，那这份环境不可信。
+        print("\n**核对没过，所以不能说「还原完成」** —— 上面标 ✗ 的那几条"
+              "装出来的东西和锁里记的不是同一份。", file=sys.stderr)
+        return verify_rc
+    print(f"\n还原完成：{len(known)} 条全部与 {LOCK_PATH.name} 核对通过"
+          f"（新下 {n_fresh} 条，复用已装 {len(already)} 条）。")
+    print("接着体检：python tools/check_tools.py --level L3")
+    return EXIT_OK
+
+
 # ---------------------------------------------------------------- CLI
 
 
@@ -801,7 +1008,9 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--list", action="store_true", help="列出清单里的软件与安装状态")
     g.add_argument("--install", nargs="+", metavar="ID", help="安装指定的软件")
     g.add_argument("--for-level", choices=["L1", "L2", "L3"], help="装某一级别缺失能力所需的软件")
-    ap.add_argument("--lock", action="store_true", help="记录 sha256 到 .tools/tools.lock.json")
+    ap.add_argument("--restore-lock", action="store_true",
+                    help="照 tools/tools.lock.json 把软件装回来，并报出锁没盖到的地方")
+    ap.add_argument("--lock", action="store_true", help="记录 sha256 到 tools/tools.lock.json")
     ap.add_argument("--verify-lock", action="store_true",
                     help="把缓存里的归档与锁里记的 sha256 对一遍，不一致就退出码非 0")
     ap.add_argument("--force", action="store_true",
@@ -821,8 +1030,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {p}", file=sys.stderr)
         return EXIT_ENV
 
+    # 只在入口处搬，不放 _read_lock 里：那样连单元测试（猴补丁 LOCK_PATH）
+    # 都会顺手搬一份真锁进临时目录，读锁的函数不该有副作用。
+    _migrate_legacy_lock(verbose=not args.quiet)
+
     if args.verify_lock:
         return do_verify_lock(manifest)
+    if args.restore_lock:
+        return do_restore_lock(manifest, not args.quiet, args.force)
     if args.list:
         return do_list(manifest)
     if args.for_level:

@@ -66,22 +66,35 @@ python tools/setup_tools.py --for-level L2 --lock
 | `software+code` | **两边都缺**：软件要装，装完还得补代码 | 明说「只补一边都不算齐」 |
 | `software` + WSL-only | 缺的软件 **Windows 原生装不了** | **单列**，不进安装建议 |
 
-第三类（`software+code`）是 2026-09-29 加的第 4 个取值，**当前有 6 条**：
-`cov.code`、`lint.style`、`sta.estimate`、`cdc.formal`、`formal.prop`、`formal.lec`。
-其中后 5 条原先标的是 `software`（理由是「卡口是 X 不是代码」），
+第三类（`software+code`）是 2026-09-29 加的第 4 个取值，**当前有 7 条**：
+`cov.code`、`lint.style`、`sta.estimate`、`sva.assert`、`cdc.formal`、`formal.prop`、`formal.lec`。
+其中 6 条原先标的是 `software`（理由是「卡口是 X 不是代码」），
 但那个理由把**优先级**当成了**状态**——软件装没装，跟代码缺不缺是两件事。
-软件一装，这 5 条就被报成可用，**L3 可用数因此虚高到 11/19，实际是 6/19**。
+软件一装，这几条就被报成可用，**L3 可用数因此虚高到 11/19，实际是 6/19**。
+
+★ **`sva.assert` 是第 7 条，而且是「漏网」的那一条**：前 6 条在 2026-09-29 那次
+集中修正里被找出来了，它没有——因为当时 `mingw` 还没装，它读起来只是「要装
+verilator + mingw」。**等 mingw 真装上的那一刻，它立刻被判成「可用」，而实测跑不出来**
+（见下节的实测表）。所以它既是一次修正，也是那条「谎会延迟到装完才发作」的**现场复现**：
+空谈状态永远看不出问题，得真去装一次。
 它和 `code` **不能挤成一位**：`code_gap` 对「只缺代码」和「两边都缺」都是 True，
 而两句给使用者的下一步完全相反——前者「等仓库补，装什么都没用」，
 后者「可以先装起来，但装完还不齐」。所以 `CapabilityStatus` 上
 `code_gap` / `software_gap` / `both_gaps` 是三个独立的位，
 `evaluate()` 里 `ok` 的条件也从 `gap != "code"` 改成 `not c.needs_code`。
-⚠️ 这 6 条的软件**现在都已就位**，所以 `software_gap` 全是 False、
+⚠️ 这 7 条的软件**现在全都已就位**，所以 `software_gap` 基本是 False、
 `check_tools` 对它们一律输出「缺的是代码不是软件」——
 **别再说它们「要先装 X」**。
 **最要命的是这个谎会延迟发作**：写错成 `software` 时，装之前报告一切正常，
 装上 mingw 那一刻才变成「一边报可用、一边打印 caveat 说不可用」。
 负例见 `check_manifest.py` 负例 8a——它同时验了装之前和装之后两个状态。
+
+★ **2026-09-29 mingw 装完，这个延迟发作的谎真的发作了一次**：`sva.assert` 当时标的是
+`software`（requires `verilator` + `mingw`），两个一装齐，`evaluate()` 立刻判它**可用**，
+而实测**根本跑不通**——verilator 的 C++ 链路还有 MAKE / 硬编码的 `PYTHON3` / 链接期
+`WinMain` 三关没接，本仓库一行代码都没写。`mingw.caveat` 里明明写着「这一步尚未实现」，
+`gap` 却让它判成了可用。**已改成 `software+code`**，L3 可用数从虚高的 8/19 回落到 7/19
+（剩下那条 `toolchain.cc` 是真涨的：本仓库现在真有一个能用的现代 g++ 了）。
 
 第四类最容易搞错：`opensta` / `openroad` 是 WSL-only，`setup_tools.py` 会拒绝安装。
 如果它们被混进「装上这些可补」的清单里，使用者照着装会发现装不上——所以
@@ -122,8 +135,9 @@ yosys-slang-plugin，没有独立的 slang.exe」，实测 `.tools/oss/bin/slang
    列名从「体积」改成「**下载量**」也是这个原因：它的含义是「装它要下多少」，
    不是「它自己多大」。
 
-⚠️ **`verible` 是唯一不共这个整包的条目**（2026-09-29 装，6.9 MB 独立 zip，
-落到 `.tools/verible`）。它也是**第一个独占自己归档**的条目——正因为前面 8 条
+⚠️ **不共这个整包的条目有两条：`verible` 和 `mingw`**（后者 2026-09-29 才加）。
+`verible`（6.9 MB 独立 zip → `.tools/verible`）是**第一个**独占自己归档的条目——
+正因为前面 8 条
 全都共用 `.tools/oss`、而那个目录由先装的组件顺手建了出来，
 `_merge_into` 里「目标目录还不存在」这条路径**一直没被走到**，一装 verible 就抛
 `FileNotFoundError`（详见 `setup_tools.py` 里那段注释和 `check_manifest.py` 负例 9g）。
@@ -133,28 +147,34 @@ yosys-slang-plugin，没有独立的 slang.exe」，实测 `.tools/oss/bin/slang
 
 ### ⚠️ 磁盘占用（2026-09-29 实测）
 
-装完之后 `.tools/` 的实际占用 —— **总量 2.8 GB**，其中真正干活的是前两行：
+装完之后 `.tools/` 的实际占用 —— **总量约 4.0 GB**，其中前三行是大头：
 
 | 目录 | 占用 | 是什么 | 能删吗 |
 |---|---|---|---|
 | `.tools/oss` | **2.1 GB** | 整包解压出来的东西（含 slang / gtkwave / eqy / sby 等 8 个条目的内容） | ❌ 别无选择，它就是这个量和这个位置 |
-| `.tools/_cache` | 605 MB | 下载原件（整包 572 MB + iverilog 安装包 27 MB + verible 6.9 MB） | ❌ **别删**，见下 |
+| `.tools/mingw` | **940 MB** | MinGW-w64 解压后的样子（**zip 只有 261 MB，解开来是 3.6 倍**——gcc 的 include/ 和 lib/ 占大头） | ❌ 删了 `cov.code` / `sva.assert` 连软件那一半都没了 |
+| `.tools/_cache` | 866 MB | 下载原件（整包 572 MB + mingw 261 MB + iverilog 27 MB + verible 6.9 MB） | ❌ **别删**，见下 |
 | `.tools/iverilog` | 85 MB | iverilog + gtkwave | ❌ 课程 L1 起就要用 |
-| `.tools/verible` | 17 MB | Verible 的 11 个可执行文件（**唯一一个不共 `.tools/oss` 的独立包**） | ❌ 装了才有的那点能力就靠它 |
+| `.tools/verible` | 17 MB | Verible 的 11 个可执行文件（不共 `.tools/oss` 的独立包之一） | ❌ 装了才有的那点能力就靠它 |
+
+★ **`mingw` 是清单里性价比最差的一项，装之前想清楚**：下 261 MB、占 940 MB 磁盘，
+换来的是「有一个现代 g++」，而 `cov.code` / `sva.assert` **装完仍然不能动手**
+（还有三关没接，见下节）。`toolchain.cc` 那一条是真拿到了。
 
 **只有缓存可删，而缓存恰恰不该删**：`--verify-lock` 是拿缓存里的文件算 sha256
-去对锁记录的。缓存不在，它只能报「无法校验 5」——**全绿变成全没查**，
+去对锁记录的。缓存不在，它只能报「无法校验 6」——**全绿变成全没查**，
 而锁存在的意义正是防那份 572 MB 被截断或换掉（静默截断这事真发生过，见下）。
-省 605 MB 把这道校验废掉，不划算。
+省 866 MB 把这道校验废掉，不划算。
 
-**目前没有卸载 / 回收命令**，`.tools/` 是 gitignore 的、删了就得重下 572 MB。
+**目前没有卸载 / 回收命令**，`.tools/` 是 gitignore 的、删了就得重下 572 MB + 261 MB。
 装之前先确认磁盘够 —— 这张表是使用者第一次跑 `--install yosys --lock`
 **之前**就有权知道的数字。清单只管「装」不管「卸」，这一节补的就是另一半。
 
 > 2026-09-29 清理记录：删掉了 4 份**改整包之后再没人读**的旧分组件资产
 > （`windows-x64-{yosys,verilator,utils,system-resources}.tgz`，74.2 MB）和
 > `build/formaltest/`。删前核对过清单与锁里都没有活引用，删后 `--verify-lock`
-> 仍是 `通过 4，不一致 0，无法校验 0`。以后再混进旧资产，照这个办法删。
+> 仍是 `通过 4，不一致 0，无法校验 0`（**这是当时那个时间点的数**，锁后来长到 6 条）。
+> 以后再混进旧资产，照这个办法删。
 
 ### ⚠️ 「文件在」≠「能用」：`check` 里的三个字段
 
@@ -179,8 +199,99 @@ yosys-slang-plugin，没有独立的 slang.exe」，实测 `.tools/oss/bin/slang
   连 `-fcf-protection=none`（GCC 8+ 才有）都不认，而 verilator 是按 GCC 15.2.1 配的。
   没有 `functional` 的话，它会以"找到了系统 PATH 上的 g++"为由被判为合格。
 
+### ★ 「自检通过」离「这条能力能动手」还有多远（mingw 的实测）
+
+**这是 `found` / `usable` 之外还要再分一层的最直白的例子。** `mingw` 装完：
+
+```
+found  = True
+usable = True      ← functional 那条 g++ 自检真的编过了，不是假的
+```
+
+**但它换来的能力仍然不能动手。** 2026-09-29 拿一份最小的 SVA 文件实测 verilator
+`--binary` 全链路，卡点依次是三关：
+
+| # | 卡在哪 | 为什么 | 本仓库做了吗 |
+|---|---|---|---|
+| 1 | `make` 找不到 | verilator 认 `MAKE` 环境变量，指到 `.tools/mingw/bin/mingw32-make.exe` 即可 | ❌ 没接 |
+| 2 | `python3` 是商店占位桩 | `verilated.mk` 里 `PYTHON3 = python3` 是**硬编码**、会盖掉环境变量；PATH 上那个 `python3` 是 `WindowsApps\python3`（退出码 49）。得用 **make 命令行变量**才顶得过去 | ❌ 没接 |
+| 3 | **链接失败** | 过了前两关所有 `.cpp` 都编得出来，最后 `undefined reference to WinMain` + 一串 `std::__cxx11::basic_string<...>::basic_string(...&&)` | ❌ 没接 |
+
+**这张表的用法**：`usable=True` 只证明「g++ 能编 verilator 风格的代码」，
+**不证明「verilator 能借它造出模型」**。后者才是 `cov.code` / `sva.assert` 要的。
+所以那两条的 `gap` 是 `software+code` 而不是 `software`——
+**装完软件那一刻它们会被 `evaluate()` 判成可用，而实际跑不出来**，正是最该防的那类谎。
+
+顺带纠正一条旧结论：以前写的是「瓶颈是编译器不是 make，换现代 mingw 就好」。
+换完之后发现**只对了一半**——编译器那一层解决了，上面这三关一层都没少。
+
 ⚠️ **可复现性**：OSS CAD Suite 的 `bucket-*` 是**滚动 tag**，同名资产每天被覆盖。
 要固定版本必须 `--lock` 记 sha256——不带 `--lock` 的安装等于「装到哪个算哪个」。
+
+### ★ 判题环境怎么保证一致（锁在 `tools/tools.lock.json`）
+
+**二进制不进库**（`.gitignore` 忽略整个 `.tools/`，约 4.0 GB），**锁进库**。
+这两件事缺一不可，分开说清楚：
+
+| | 放哪 | 为什么不这么放不行 |
+|---|---|---|
+| 工具二进制（约 4.0 GB） | `.tools/`，**gitignore** | 传上去仓库就没法用了；而且它们本来就该按平台重装 |
+| **锁**（`tools/tools.lock.json`） | `tools/`，**入库** | 它记录每个归档的 sha256 + `(repo, tag, asset)`，是「大家装的是不是同一份」的唯一依据 |
+
+```bash
+python tools/setup_tools.py --install yosys verilator --lock   # 装 + 记锁
+python tools/setup_tools.py --verify-lock                      # 拿缓存核对 sha256
+python tools/setup_tools.py --restore-lock                     # 照锁把软件装回来
+```
+
+★ **锁是闸门不是收据**：`install_one` 里 sha256 对不上就 `return False` **拒绝安装**
+（要 `--force` 才放行）。理由见 `_lock_problem` 的注释——「装完再告诉你这份不对」
+已经晚了，坏的工具已经在 `.tools/` 里了。
+
+★ **`--restore-lock` 是「拉下代码之后怎么把环境弄成作者那样」的那一个动作。**
+它跟 `--for-level` / `--install` 不是一回事：`--for-level L2` 装的是「L2 需要什么」
+（随清单变动而变），`--install X` 装的是「我要 X」（靠人眼抄 id，抄漏一条两边都看不出来）。
+只有 `--restore-lock` 是**照锁里记的那一份**装。
+
+**它最要紧的不是装了什么，是它明说装不了什么**：锁覆盖不到的地方会**分两桶印出来**——
+「能锁但没锁」（版本可能和作者不同）和「不归这把锁管」（`iverilog` 走另一个安装器、
+没有 sha256 就归这桶）。两桶混在一起，使用者会以为 `iverilog` 也是个「补一下就好」的洞。
+还原时**不写锁**（`do_install(..., lock=False)`）：这条命令的方向是「照锁装」，
+顺手把本次下载的哈希记进去，参照物就变成本次结果了，锁也就不再是锁。
+
+★ **它最后一定会补一次 `--verify-lock`，那句「还原完成」的凭据是这次核对，不是安装成功。**
+这不是锦上添花，是 2026-09-29 实测抓出来的漏洞：`install_one` 里 `_already_installed`
+的短路发生在 `_lock_problem` **之前**，所以在一台装好的机器上，「已装」的条目
+**一次都不会碰锁**，`do_install` 返回绿只说明「装的过程没报错」。实测现场是同一把锁
+两个答案——把 `yosys` 的 sha256 改成 64 个 0，`--verify-lock` 正确报「不一致 1」，
+而 `--restore-lock` 照样印「完成：6 条按锁还原」。现在核对红了就**不许说「还原完成」**，
+改成一句实话并以非零码退出；报告里也把「新下 N 条」和「复用已装 M 条」分开印，
+因为**只有后者是靠这次核对兜住的**（同「两个计数必须分开报」）。
+
+★ **2026-09-29 之前锁在 `.tools/tools.lock.json`，跟二进制一起被忽略了**，
+所以它**从来没进过库**。后果不是「少一份文件」，而是**锁对作者生效、对别人不生效**：
+新克隆的人手里没锁，`_lock_problem` 查不到 entry 就 `return None`（"第一次装，
+天经地义"），每次安装都放行——**两边都报「安装成功」，一边真被保护、一边没有**。
+现在锁入库，并且 `main()` 里有一次 `_migrate_legacy_lock()`：老用户升级后
+自动把旧位置的锁搬过来，**不然他们会从「受保护」悄悄退回「没保护」而看不出变化**。
+
+**这套机制目前的边界（别高估它）**：
+
+- 清单里 12 条带 `source`，锁里目前 **6 条**（装的时候加了 `--lock` 的才算）。
+  没进锁的那几条**装完不校验**。
+- ★ **按资产判覆盖，不按 id**：`slang` / `formal` / `eqy` / `z3` 没各自的锁记录，
+  但它们跟 `yosys` 是**同一个 tgz**，已经被锁住了 —— 报成缺口就是凭空造一个洞。
+  `_locked_assets()` 就是干这个的（`--restore-lock` 也用它）。
+- **`iverilog` 完全不在锁的覆盖范围内**：它由 `setup_toolchain.py` 装，走的是
+  另一条路，文件名带日期但**没有 sha256**，而且 `INSTALLER_CANDIDATES` 是
+  `[v14-20260804, v12-20220611]` 顺次尝试——v14 的 URL 一旦失效会**静默回退到
+  2022 年的 v12**。而 iverilog 是 L1 起唯一依赖、也是 `sim.py` 判定内核的编译器，
+  这一条是当前最松的环节。`--restore-lock` 会**专门把它点出来**，不会装作盖到了。
+- 所有 `tag` 都是**日期/版本钉死的**（没有 `bucket-*`），这一半本来就做了。
+
+**还有一层保障是无意的但很有效**：smoke 检查器大量使用**手写样本**而不是跑真工具
+（`check_vlint.py` 明写了理由是「靠真实运行去凑，换个 verilator 版本就变了」）。
+所以环境漂移会让检查**变红**，而不是静默换个答案——**smoke 本身就是一致性检验**。
 
 ### 判定 / 观察 / 叙述：三层，权威性单向
 

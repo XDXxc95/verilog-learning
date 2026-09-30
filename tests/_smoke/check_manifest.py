@@ -1457,6 +1457,63 @@ with tempfile.TemporaryDirectory() as td:
         ST.do_install = real_install
         ST.do_verify_lock = real_verify
 
+# ---------------------------------------------------------------- 负例 9j：--purge-cache 别把预演当真删
+#
+# `.tools/_cache` 里的归档装完之后只剩一个用途（给 --verify-lock 重算 sha256），
+# 但它是磁盘上**唯一一份原始归档**——整包那个 572 MB，删了要重下。
+# 既然代价是「重下几百 MB」，这条命令就有两个必须守住的地方：
+#   ① 默认**只预演**，一个字节都不许动
+#      （变异：把 `if not force:` 改成 `if False:` → 预演就真删，下面第一条变红）
+#   ② 只删文件，**目录一律不动**（别人的东西不替人做主）
+#      （变异：把 dirs 也一起 rmtree → 第二条变红）
+#   ③ 必须说清「删完 --verify-lock 会变成『无法校验 N』」——那是「没查」不是
+#      「不一致」，含义相反。不说，使用者下次看到一排 `?` 会去查一个不存在的事故。
+#      （变异：把那句删掉 → 第三条变红）
+# 外加正向对照：真的删过之后，输出得能分清「可回收多少」和「已回收多少」。
+with tempfile.TemporaryDirectory() as td:
+    tmp = Path(td)
+    cache = tmp / "_cache"
+    cache.mkdir()
+    (cache / "big.tgz").write_bytes(b"x" * 4096)
+    (cache / "small.zip").write_bytes(b"y" * 128)
+    (cache / "halfway.zip.part").write_bytes(b"z" * 64)
+    (cache / "somedir").mkdir()
+    (cache / "somedir" / "keep.txt").write_text("别动我", encoding="utf-8")
+
+    real_cache = ST.CACHE_DIR
+    ST.CACHE_DIR = cache
+    try:
+        def _run(force: bool) -> tuple[int, str, str]:
+            out, err = io.StringIO(), io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                rc = ST.do_purge_cache(verbose=True, force=force)
+            return rc, out.getvalue(), err.getvalue()
+
+        rc, out, err = _run(force=False)
+        check(rc == ST.EXIT_OK, f"预演却报错（rc={rc}）")
+        check((cache / "big.tgz").is_file() and (cache / "small.zip").is_file()
+              and (cache / "halfway.zip.part").is_file(),
+              "**预演就把文件删了** —— 印得跟真删一样，使用者以为空间已经回来了")
+        check("一个字节都没删" in out,
+              f"预演没说自己什么都没做：{out!r}")
+        check("无法校验" in out,
+              f"没说清删完 --verify-lock 会变成「无法校验」—— 下次看到一排 ? 会去查"
+              f"一个不存在的事故：{out!r}")
+        # 4096 + 128 + 64 = 4288 B → _human 取 KB 整数位 = 4 KB
+        check("合计可回收 **4 KB**" in out,
+              f"没报出可回收的体积（4096+128+64 B 应报 4 KB）：{out!r}")
+
+        rc, out, err = _run(force=True)
+        check(rc == ST.EXIT_OK, f"真删却报错（rc={rc}）")
+        check(not (cache / "big.tgz").exists() and not (cache / "small.zip").exists()
+              and not (cache / "halfway.zip.part").exists(),
+              "真删时没删干净（.part 也是缓存，留着只会骗人）")
+        check((cache / "somedir" / "keep.txt").is_file(),
+              "**把目录也删了** —— _cache 里出现目录时不该替人做主")
+        check("已删 3 份" in out, f"没报清删了几份：{out!r}")
+    finally:
+        ST.CACHE_DIR = real_cache
+
 # ---------------------------------------------------------------- 负例 9g：首次安装时目标目录不存在
 #
 # 2026-09-29 装 verible 实测踩到：`_merge_into(staging, dest)` 里 `dest` 是

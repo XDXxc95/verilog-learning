@@ -242,6 +242,7 @@ usable = True      ← functional 那条 g++ 自检真的编过了，不是假�
 python tools/setup_tools.py --install yosys verilator --lock   # 装 + 记锁
 python tools/setup_tools.py --verify-lock                      # 拿缓存核对 sha256
 python tools/setup_tools.py --restore-lock                     # 照锁把软件装回来
+python tools/setup_tools.py --purge-cache                      # 看 _cache 占了多少（只预演）
 ```
 
 ★ **锁是闸门不是收据**：`install_one` 里 sha256 对不上就 `return False` **拒绝安装**
@@ -282,12 +283,39 @@ python tools/setup_tools.py --restore-lock                     # 照锁把软件
 - ★ **按资产判覆盖，不按 id**：`slang` / `formal` / `eqy` / `z3` 没各自的锁记录，
   但它们跟 `yosys` 是**同一个 tgz**，已经被锁住了 —— 报成缺口就是凭空造一个洞。
   `_locked_assets()` 就是干这个的（`--restore-lock` 也用它）。
-- **`iverilog` 完全不在锁的覆盖范围内**：它由 `setup_toolchain.py` 装，走的是
-  另一条路，文件名带日期但**没有 sha256**，而且 `INSTALLER_CANDIDATES` 是
-  `[v14-20260804, v12-20220611]` 顺次尝试——v14 的 URL 一旦失效会**静默回退到
-  2022 年的 v12**。而 iverilog 是 L1 起唯一依赖、也是 `sim.py` 判定内核的编译器，
-  这一条是当前最松的环节。`--restore-lock` 会**专门把它点出来**，不会装作盖到了。
+- **`iverilog` 不在这把锁的覆盖范围内**：它由 `setup_toolchain.py` 装，走的是
+  另一条路（Inno 安装包 + 「装到默认位置再整体搬进 `.tools/`」），
+  硬塞进这把锁会让 `--restore-lock` 报一条假的「没写 install.dest」失败。
+  `--restore-lock` 会**专门把它点出来**，不会装作盖到了。
+  ★ **但它自己有另一套钉法**（2026-09-29 补）：sha256 记在 `setup_toolchain.py`
+  的 `INSTALLER_SHA256`（随代码入库），下载完**一律核验**（缓存命中也核），
+  对不上就**拒装**且**不许回落到下一个候选**——回落的是 2022 年的 v12，
+  另一份编译器。回落现在会印一段大字，不再静默。核对用
+  `python tools/setup_toolchain.py --verify`：它**分两头报**，因为「下载的包」
+  和「装上来的编译器」是两件事，两头都对照样会说谎（包对而版本不对 =
+  系统里另有一个 iverilog）。v12 那一份**故意不钉哈希**——作者没下过它，
+  编一个等于凭空造凭证，所以它走的是「没有记录 → 无法与作者比对」那条路。
 - 所有 `tag` 都是**日期/版本钉死的**（没有 `bucket-*`），这一半本来就做了。
+
+### `--purge-cache`：866 MB 的下载归档收不收
+
+`.tools/_cache` 里躺着下载过的归档（整包 572 MB、mingw 261 MB、iverilog 安装器
+25.8 MB、verible 6.6 MB）。**装完之后它们只剩一个用途**：让 `--verify-lock`
+拿原始归档重算 sha256。所以删掉**不会动已装好的工具**，但会让
+`--verify-lock` 从「通过 N」变成「**无法校验 N**」——那是「没查」不是「不一致」。
+
+```bash
+python tools/setup_tools.py --purge-cache           # 只预演，列出来 + 报能回收多少
+python tools/setup_tools.py --purge-cache --force   # 真删
+```
+
+默认**只预演**：删的是磁盘上唯一一份原始归档，重装时得重下（整包那个 572 MB
+尤其疼），所以不该让一次手滑决定它。目录不删（`_cache` 里出现目录时不替人做主）。
+
+★ **判据是「这 866 MB 换到的是什么」**：留着它，`--verify-lock` 是个能真跑的
+一致性检验；删了它，那条命令就只剩「无法校验」，而**锁记录本身还在库里**——
+`--install X --lock` 重下一份就能恢复。也就是说这是个**纯空间换便利**的取舍，
+不是「删了就坏」。当前选的是留着。
 
 **还有一层保障是无意的但很有效**：smoke 检查器大量使用**手写样本**而不是跑真工具
 （`check_vlint.py` 明写了理由是「靠真实运行去凑，换个 verilator 版本就变了」）。

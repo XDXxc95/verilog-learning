@@ -513,7 +513,8 @@ def main() -> int:
 TOOL_CHECKS = ["check_wave.py", "check_wave_js.py", "check_wave_draw.py",
                "check_observe.py", "check_schematic.py", "check_lesson.py",
                "check_regress.py", "check_synth.py", "check_cov.py",
-               "check_toggle.py", "check_manifest.py", "check_vlint.py"]
+               "check_toggle.py", "check_manifest.py", "check_vlint.py",
+               "check_toolchain.py"]
 
 
 def _run_tool_checks() -> int:

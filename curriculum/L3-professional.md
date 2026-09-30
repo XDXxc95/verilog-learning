@@ -26,7 +26,7 @@
 | 形式验证 | ⚠️ **sby / eqy / z3 已装好且手动跑得通**（实测 sby + `smtbmc z3` 的 k-induction 作业跑出 `DONE (PASS, rc=0)`），**但那是手敲命令行跑的、不是仓库跑的** —— `tools/` 里没有调用它们的入口，所以这一项**在仓库里跑不了** | ❌ 规模和易用性远不如商业工具 |
 | DFT / 低功耗 | ⚠️ 只能讲概念和接口 | ❌ **Windows 原生无方案**。且 L3-14 / L3-13 大纲本来就没承诺动手 |
 
-**装不装由你定，缺工具不阻塞开课。** 跑 `python tools/check_tools.py --level L3` 看这一级缺什么、缺了会怎样、装什么能补，然后 `python tools/setup_tools.py --install <id> --lock` 装到仓库里（不影响系统环境）。想一次装成跟作者一样，用 `python tools/setup_tools.py --restore-lock`——它照 `tools/tools.lock.json` 装，并**顺带告诉你锁盖不到哪里**（`iverilog` 就没 sha256、不在锁里）。
+**装不装由你定，缺工具不阻塞开课。** 跑 `python tools/check_tools.py --level L3` 看这一级缺什么、缺了会怎样、装什么能补，然后 `python tools/setup_tools.py --install <id> --lock` 装到仓库里（不影响系统环境）。想一次装成跟作者一样，用 `python tools/setup_tools.py --restore-lock`——它照 `tools/tools.lock.json` 装，并**顺带告诉你锁盖不到哪里**（`iverilog` 不在那把锁里，它由 `setup_toolchain.py` 单独装、单独钉版本）。
 
 **注意 `verilator` 分两条路，成本差很多**：`--lint-only` 装完即用；`--binary`（真正编译仿真模型，覆盖率、并发断言靠它）需要 C++ 编译器 + `make`。别把「装了 verilator」当成「断言能跑了」。
 

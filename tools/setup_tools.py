@@ -791,6 +791,75 @@ def do_verify_lock(manifest) -> int:
     return EXIT_OK
 
 
+def _human(n: int) -> str:
+    return f"{n / 1048576:.1f} MB" if n >= 1048576 else f"{n / 1024:.0f} KB"
+
+
+def do_purge_cache(verbose: bool = True, force: bool = False) -> int:
+    """回收 `.tools/_cache` 里的下载归档。
+
+    ★ 这个目录装完之后**只剩一个用途**：让 `--verify-lock` 拿原始归档重算 sha256。
+      所以清掉它**不会动已装好的工具**（那些在 .tools/<id>/ 下），
+      但会让 `--verify-lock` 从「通过 N」变成「**无法校验 N**」——
+      那是「没查」不是「坏了」，含义相反。这句话必须印出来，
+      否则使用者下次看到一排 `?` 会以为锁出问题了，转头去查一个不存在的事故。
+
+    ★ 默认**只预演、不删**（`--force` 才真删）。删的是磁盘上唯一一份原始归档，
+      重装时得重下——整包那个 572 MB 尤其疼。既然代价是「重下几百 MB」，
+      就不该让一次手滑决定它。
+    """
+    if not CACHE_DIR.is_dir():
+        print(f"{CACHE_DIR} 不存在——没有可回收的东西（也就意味着从没下载过）。")
+        return EXIT_OK
+
+    # 只扫一层，不递归；目录一律不动（可能有别人放的东西，不替人做主）。
+    files: list[Path] = []
+    dirs: list[Path] = []
+    for p in sorted(CACHE_DIR.iterdir()):
+        if p.is_dir():
+            dirs.append(p)
+        elif p.is_file():
+            files.append(p)
+
+    full = [p for p in files if not p.name.endswith(".part")]
+    part = [p for p in files if p.name.endswith(".part")]
+    n_full = sum(p.stat().st_size for p in full)
+    n_part = sum(p.stat().st_size for p in part)
+
+    print(f"{CACHE_DIR}\n")
+    for p in full:
+        print(f"  {_human(p.stat().st_size):>10}  {p.name}")
+    for p in part:
+        print(f"  {_human(p.stat().st_size):>10}  {p.name}   ← 未下完（删了就从零开始）")
+    for d in dirs:
+        print(f"  {'--':>10}  {d.name}/   ← 目录，**不动**")
+    print(f"\n完整归档 {len(full)} 份 {_human(n_full)}，"
+          f"未完成 {len(part)} 份 {_human(n_part)}，"
+          f"合计可回收 **{_human(n_full + n_part)}**")
+
+    if not force:
+        # 「能回收多少」和「已经回收了多少」必须分开说 —— 预演印得跟真删一样，
+        # 使用者会以为空间已经回来了（同 lint.ran / n_warnings 那条老账）。
+        print("\n**以上只是预演，一个字节都没删。** 真要删：加 --force\n"
+              "（删完 --verify-lock 会从「通过 N」变成「无法校验 N」——"
+              "那是没查，不是不一致；重装时得重下）")
+        return EXIT_OK
+
+    freed = 0
+    for p in full + part:
+        try:
+            size = p.stat().st_size
+            p.unlink()
+            freed += size
+        except OSError as exc:
+            print(f"  [失败] {p.name}：{exc}", file=sys.stderr)
+            return EXIT_FAIL
+    print(f"\n已删 {len(full) + len(part)} 份，回收 {_human(freed)}。")
+    print("★ 现在 `--verify-lock` 只会报「无法校验 N」—— **那不是不一致**。"
+          "要恢复可校验状态，重跑一次 --install <id> --lock 把归档拉回来。")
+    return EXIT_OK
+
+
 def do_install(manifest, ids: list[str], verbose: bool, lock: bool,
                force: bool = False) -> int:
     by_id = {s.id: s for s in manifest.software}
@@ -1002,6 +1071,8 @@ def main(argv: list[str] | None = None) -> int:
             "  python tools/setup_tools.py --list\n"
             "  python tools/setup_tools.py --install yosys verilator --lock\n"
             "  python tools/setup_tools.py --for-level L2\n"
+            "  python tools/setup_tools.py --purge-cache          # 先看能回收多少\n"
+            "  python tools/setup_tools.py --purge-cache --force  # 真删\n"
         ),
     )
     g = ap.add_mutually_exclusive_group(required=False)
@@ -1013,6 +1084,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--lock", action="store_true", help="记录 sha256 到 tools/tools.lock.json")
     ap.add_argument("--verify-lock", action="store_true",
                     help="把缓存里的归档与锁里记的 sha256 对一遍，不一致就退出码非 0")
+    ap.add_argument("--purge-cache", action="store_true",
+                    help="回收 .tools/_cache 里的下载归档（默认只预演，--force 才真删）")
     ap.add_argument("--force", action="store_true",
                     help="无视「已安装」短路与锁记录，强制重装（会覆盖锁）")
     ap.add_argument("--quiet", action="store_true", help="少打印")
@@ -1034,6 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
     # 都会顺手搬一份真锁进临时目录，读锁的函数不该有副作用。
     _migrate_legacy_lock(verbose=not args.quiet)
 
+    if args.purge_cache:
+        return do_purge_cache(not args.quiet, args.force)
     if args.verify_lock:
         return do_verify_lock(manifest)
     if args.restore_lock:

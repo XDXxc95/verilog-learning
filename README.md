@@ -125,6 +125,8 @@ solutions/L1-05/decoder3_8.v       参考答案
 | 装某个工具（进 `.tools/`） | `python tools/setup_tools.py --install yosys verilator --lock` |
 | **核对工具和作者那边是不是同一份** | `python tools/setup_tools.py --verify-lock` |
 | **照锁还原成作者那套环境**（拉下代码后跑这个） | `python tools/setup_tools.py --restore-lock` |
+| 看 `.tools/_cache` 的下载归档占了多少（只预演） | `python tools/setup_tools.py --purge-cache` |
+| **核对 iverilog 是不是作者那一份**（版本 + 安装包哈希） | `python tools/setup_toolchain.py --verify` |
 | 工具链自检（改过工具就跑） | `python tests/_smoke/run_smoke.py` |
 
 > **学到哪一级，工具就配到哪一级。** 仓库不预先装一大堆——L1 只需要 iverilog（已装），
@@ -274,8 +276,15 @@ python tools/setup_toolchain.py --selftest   # 装完编译+仿真跑一遍验�
 > 而不是装完再警告。详见 [`tools/README.md`](tools/README.md) 的「判题环境怎么保证一致」。
 >
 > 拉下代码后想一次把环境弄成作者那样，跑 `python tools/setup_tools.py --restore-lock`。
-> 它会**顺带告诉你锁盖不到哪里**——`iverilog` 就没有 sha256、不在锁里，
+> 它会**顺带告诉你锁盖不到哪里**——`iverilog` 不在那把锁里（它的安装是另一条路），
 > 这条命令会明确点出来，而不是让你以为环境已经一模一样。
+> `iverilog` 单独有一套钉法：`python tools/setup_toolchain.py --verify` 核对
+> 「装上来的是不是 14.0」和「安装包的 sha256 对不对」，两头分开报。
+>
+> `.tools/_cache` 里还压着 **866 MB** 下载过的归档（整包 / mingw / iverilog / verible）。
+> 装完之后它们只剩「给 `--verify-lock` 重算 sha256」这一个用途，删了不影响已装的工具，
+> 但 `--verify-lock` 会变成「无法校验」。想看能回收多少：`--purge-cache`（只预演）；
+> 确定不留了才加 `--force`。**当前选的是留着**——866 MB 换一条能真跑的一致性检验。
 
 ---
 

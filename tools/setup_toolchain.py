@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -37,6 +38,25 @@ INSTALLER_CANDIDATES = [
     "iverilog-v14-20260804-x64_setup.exe",
     "iverilog-v12-20220611-x64_setup.exe",
 ]
+
+# 作者实际装过、并且 `iverilog -V` 报 14.0 的那一份安装包的 sha256。
+#
+# ★ 为什么只钉 v14、**不钉 v12**：钉一个自己没下过的哈希，就是**凭空造一张凭证**。
+#   本仓库判「判题环境一致」全靠哈希，编一个出来比没有更坏 —— 没有哈希时
+#   工具会说「这一份没记录」，编出来的哈希会让它说「核对通过」。所以 v12
+#   在下面走的是「无记录」那条路：**允许装，但必须大声说清它不是作者那份**。
+# ★ 为什么它不在 `tools/tools.lock.json` 里：那条路要经 `do_install`，而 iverilog
+#   没有 `install` 段（它的安装是「Inno 静默装到默认位置再整体搬」，
+#   见本文件与 CLAUDE.md 的说明）——硬塞进锁会让 `--restore-lock` 报一条假的
+#   「iverilog 没写 install.dest」失败。所以它的钉法在这里，独立于那把锁。
+INSTALLER_SHA256 = {
+    "iverilog-v14-20260804-x64_setup.exe":
+        "5d65c90c269af75c12ba6e9af6ceb0d64511ea8913d0b2a28eb82e697521cf17",
+}
+
+# 钉住的那一份对应的版本号（`iverilog -V` 首行的 `version X.Y`）。
+# 用来回答「装出来的到底是不是作者那一份」——**哈希管下载，版本管装上之后**。
+PINNED_VERSION = "14.0"
 DOWNLOAD_TIMEOUT = 60
 CHUNK = 256 * 1024
 # 安装步骤的超时。安装包会弹出组件选择窗口需要人手点一下，
@@ -116,20 +136,97 @@ def _path_diff(before: dict, after: dict) -> list[str]:
 
 # ---------------------------------------------------------------- 下载
 
+class InstallerRejected(Exception):
+    """安装包的 sha256 与钉住的不符。
+
+    ★ 单独一个类型，**故意不继承 RuntimeError**：下面那个重试循环要吞掉
+      `URLError / OSError / RuntimeError` 去试下一个候选，而「这一份被人换过」
+      **不是**「这个地址拿不到」—— 前者必须硬停并原样报出来。混进去的话，
+      被篡改的 v14 会安静地变成「v14 不行，改下 v12」，而使用者只知道
+      「最后装上了」。这正是本仓库最防的那类谎。
+    """
+
+
+def sha256_of(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def check_installer(name: str, path: Path) -> tuple[str, str]:
+    """把一份安装包和钉住的 sha256 对一下。返回 (状态, 说明)。
+
+    状态三取值**必须分开报**（同 `--verify-lock` 的 通过/不一致/无法校验，
+    也同 `lint.ran` / `n_warnings` 那笔老账）：
+      `ok`      —— 对上了，这份就是作者用的那一份
+      `bad`     —— **有记录但对不上**：文件被换过/截断，绝不能拿去装
+      `unknown` —— **没有记录**：既不是通过也不是失败。v12 走这条路。
+    把 `unknown` 并进任何一边都是谎：并进 ok 是拿「没查」冒充「查过了」，
+    并进 bad 是拿「没查」冒充「坏了」。
+    """
+    want = INSTALLER_SHA256.get(name)
+    if not want:
+        return "unknown", (
+            f"{name} 没有 sha256 记录 —— 它是候选里的回落版本，作者没装过它。"
+            f"**装出来的环境无法与作者比对**（判题用的编译器可能不是同一个）。"
+        )
+    got = sha256_of(path)
+    if got != want:
+        return "bad", (
+            f"{name} 的 sha256 对不上：\n"
+            f"        锁里 {want}\n"
+            f"        实际 {got}\n"
+            f"        这份**不装** —— 要么服务器上换了文件，要么下载被篡改/截断。"
+        )
+    return "ok", f"{name} sha256 {got[:16]}… 与钉住的一致"
+
+
 def download_installer(dest_dir: Path, verbose: bool = True) -> Path:
-    """下载安装包到 dest_dir。支持断点续传（服务器返回 Accept-Ranges: bytes）。"""
+    """下载安装包到 dest_dir。支持断点续传（服务器返回 Accept-Ranges: bytes）。
+
+    ★ 拿到文件之后**一律先过 sha256**，缓存命中也过（`[跳过] 已存在` 那条路）。
+      只查缓存命中而漏查新下载的，等于把最该查的那一条放过去了 ——
+      本仓库在 `_vlint.py` 的 `Verilation Report`、`_yosys.py` 的 `stat` 块上
+      反复踩过同一个坑：**判据要看「真跑过没有」，不是「有没有输出」**。
+    ★ 候选是**顺次回落**的：v14 拿不到时下一个。原来这一步是**静默**的，
+      于是「装了 v12(2022)」和「装了 v14」在下游长得一模一样。现在回落必须
+      印一段大字，并且 sha256 那关会顺带说出「这一份没有记录」。
+    """
     dest_dir.mkdir(parents=True, exist_ok=True)
     last_err: Exception | None = None
 
-    for name in INSTALLER_CANDIDATES:
+    for idx, name in enumerate(INSTALLER_CANDIDATES):
         url = DOWNLOAD_BASE + name
         target = dest_dir / name
         part = target.with_suffix(target.suffix + ".part")
 
+        if idx and verbose:
+            # ★ 回落是**理论上的降级**，不是「换个镜像」。v12 是 2022 年的编译器，
+            #   它是 L1 起唯一依赖、也是 sim.py 判对错用的那个编译器 ——
+            #   换掉它，判题结果就可能和作者不同。所以这里必须吵。
+            print()
+            print("  " + "!" * 66)
+            print(f"  !! 正在回落到 {name}")
+            print(f"  !! 首选 {INSTALLER_CANDIDATES[0]} 拿不到。这是**另一份编译器**，")
+            print("  !! 不是作者用的那一份 —— 判题结果可能不同，装完请自己确认版本。")
+            print("  " + "!" * 66)
+
         if target.is_file() and target.stat().st_size > 1_000_000:
-            if verbose:
-                print(f"  [跳过] 已存在安装包 {name}")
-            return target
+            status, msg = check_installer(name, target)
+            if status == "bad":
+                # 缓存里那份坏了不能就地用，也不能直接删（可能只是我们要重下一份），
+                # 改名为 .part 续传/重下 —— 和 setup_tools.py 里缓存复核的处理一致。
+                if verbose:
+                    print(f"  [重下] {msg}")
+                target.replace(target.with_suffix(target.suffix + ".part"))
+            else:
+                if verbose:
+                    print(f"  [跳过] 已存在安装包 {name}")
+                    if status == "unknown":
+                        print(f"         ⚠ {msg}")
+                return target
 
         # 断点续传：从 .part 的现有大小接着下
         resume_from = part.stat().st_size if part.is_file() else 0
@@ -178,7 +275,14 @@ def download_installer(dest_dir: Path, verbose: bool = True) -> Path:
                 part.unlink(missing_ok=True)
                 raise RuntimeError(f"下载内容不是有效的 Windows 可执行文件（文件头 {magic!r}）")
 
+            status, msg = check_installer(name, part)
+            if status == "bad":
+                part.unlink(missing_ok=True)
+                raise InstallerRejected(msg)
+
             part.replace(target)
+            if verbose:
+                print(f"         {msg}" if status == "ok" else f"         ⚠ {msg}")
             return target
 
         except (urllib.error.URLError, OSError, RuntimeError) as exc:
@@ -306,6 +410,15 @@ def do_install(verbose: bool = True, force: bool = False) -> int:
 
     try:
         installer = download_installer(cache, verbose=verbose)
+    except InstallerRejected as exc:
+        # 单独一条路：这不是「下不下来」，是「下来的东西不对」。给的手动步骤
+        # 也得不一样 —— 让使用者去官网自己下一个回来，再拿脚本报的实际哈希对。
+        print(f"\n[拒绝安装] {exc}")
+        print("\n这份安装包**没有装，也不会装**。想自己核实：")
+        print(f"  - 文件：{cache / INSTALLER_CANDIDATES[0]}")
+        print("  - 从 https://bleyer.org/icarus/ 重新下一份，比对上面的 sha256；")
+        print("    对不上就说明拿到的不是官方那一份，别装。")
+        return 4
     except RuntimeError as exc:
         print(f"\n[失败] {exc}")
         print("\n可手动安装：")
@@ -370,6 +483,66 @@ def _report_versions(tc) -> None:
         ver = probe_version(exe)
         print(f"  {label:<9} : {exe}")
         print(f"  {'':<9}   {ver}")
+
+
+def do_verify_installer() -> int:
+    """回答一个问题：**装出来的编译器，是不是作者用的那一份？**
+
+    ★ 这是 iverilog 特有的洞：它不在 `tools/tools.lock.json` 里（那把锁管的是
+      「有 source.asset 的归档」，而 iverilog 走 Inno 安装包 + 整体搬迁这条另路），
+      于是 `--verify-lock` 对它一个字都说不了。而它是 L1 起唯一依赖、
+      也是 `sim.py` 判对错用的那个编译器 —— 判定内核的版本漂了，
+      学习者看到的是「跑通了但答案不一样」，最难查的一种。
+    ★ 所以这里要**分两头说**，混起来就又成了「一个数表达两件事」：
+      安装包那头 = 缓存里的 sha256 对不对（下载有没有被换）；
+      装出来那头 = `iverilog -V` 的版本号对不对（真装上的是不是你下那份）。
+      两头都对照样会说谎：包对而装错版本（比如系统里另有一个 iverilog）、
+      或者版本对而包不知来源，都是真实存在的组合。
+    """
+    tc = detect()
+    print("=" * 66)
+    print("iverilog 是否与作者一致")
+    print(f"钉住的版本：{PINNED_VERSION}")
+    print("=" * 66)
+
+    print("\n[1/2] 装上来的版本")
+    if tc.iverilog is None:
+        print("  ✗ 没找到 iverilog —— 谈不上一致")
+        installed_ok = False
+    else:
+        ver = probe_version(tc.iverilog) or ""
+        installed_ok = PINNED_VERSION in ver
+        print(f"  {'✓' if installed_ok else '✗'} {tc.iverilog}")
+        print(f"      {ver}")
+        if not installed_ok:
+            print(f"  **判题用的编译器不是作者那一份**（作者是 {PINNED_VERSION}）。"
+                  f" sim.py 的结论可能因此不同。")
+
+    print("\n[2/2] 缓存里的安装包")
+    cache = repo_root() / ".tools" / "_cache"
+    n_ok = n_bad = n_unknown = 0
+    for name in INSTALLER_CANDIDATES:
+        path = cache / name
+        if not path.is_file():
+            print(f"  ? {name} 缓存里没有，**无法校验**（不是通过）")
+            n_unknown += 1
+            continue
+        status, msg = check_installer(name, path)
+        mark = {"ok": "✓", "bad": "✗", "unknown": "?"}[status]
+        print(f"  {mark} {msg}")
+        n_ok += status == "ok"
+        n_bad += status == "bad"
+        n_unknown += status == "unknown"
+
+    print(f"\n通过 {n_ok}，不一致 {n_bad}，无法校验 {n_unknown}")
+    if n_unknown and not n_ok:
+        print("一条都没校验成 —— 别把这次结果读成「包是好的」。")
+    print("\n这把锁管不到它：iverilog 不在 tools/tools.lock.json 里，"
+          "它的钉法在本文件的 INSTALLER_SHA256（随代码入库）。")
+
+    if n_bad:
+        return 4
+    return 0 if installed_ok else 4
 
 
 def do_check(as_json: bool = False) -> int:
@@ -568,6 +741,11 @@ def main(argv: list[str] | None = None) -> int:
     g.add_argument("--check", action="store_true", help="只检查工具链是否可用")
     g.add_argument("--install", action="store_true", help="下载并静默安装")
     g.add_argument("--selftest", action="store_true", help="端到端自检：编译→仿真→VCD")
+    g.add_argument(
+        "--verify",
+        action="store_true",
+        help="核对装出来的 iverilog 版本与安装包的 sha256 是否与作者一致",
+    )
     ap.add_argument("--json", action="store_true", help="以 JSON 输出检查结果")
     ap.add_argument(
         "--force",
@@ -580,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
         return do_install(force=args.force)
     if args.selftest:
         return do_selftest()
+    if args.verify:
+        return do_verify_installer()
     return do_check(as_json=args.json)
 
 

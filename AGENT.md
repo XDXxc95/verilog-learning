@@ -254,9 +254,10 @@ agent 把「写码 → 立刻出波形」做得太顺滑，学习者会永久跳
 >
 > 遇到它时你不能只说其中一句。说「装上 mingw 就能做覆盖率」是谎——
 > **2026-09-29 实测：mingw 真装上了（`usable=True`），覆盖率还是跑不了**，
-> 因为 verilator 的 C++ 链路还有 MAKE / 硬编码的 PYTHON3 / 链接三关本仓库没接。
+> 因为 verilator 的 C++ 链路还有五关（MAKE / 硬编码的 PYTHON3 / `CFG_CXXFLAGS_STD` /
+> `sc_time_stamp` / `verilator_coverage`）本仓库一行代码都没接。
 > 但说「装什么都没用」也是谎：软件那一半确实因此齐了。
-> 准确的说法是**「软件齐了，接入代码还没有，所以现在仍动不了手」**。
+> 准确的说法是**「软件齐了、配方也验证过了，但接入代码还没有，所以现在仍动不了手」**。
 
 **最后一行是最要紧的。** 环境越流畅，越容易顺手编一个"看起来对"的结果出来。
 在这个仓库里，老实说「这个我跑不了，只能手算」永远比含糊过去强。
@@ -265,9 +266,12 @@ agent 把「写码 → 立刻出波形」做得太顺滑，学习者会永久跳
 
 - **`assert property`（SVA）iverilog 直接语法错误**，verilator 只覆盖子集。
   讲到 L3 的并发断言时，说清它是"读懂 + 手写约束"，不是"跑通"。
-  ★ **而且装了现代 mingw 也没通**——2026-09-29 实测，verilator `--binary` 还有三关
-  没接（MAKE / 被 `verilated.mk` 硬编码盖掉的 PYTHON3 / 链接期的 `WinMain` 与
-  `std::__cxx11::basic_string` 未定义符号）。别因为"工具都装齐了"就把这一讲讲成能跑。
+  ★ **而且装了现代 mingw 也没通**——2026-09-30 实测，verilator `--binary` 还有五关
+  本仓库没接（MAKE / 被 `verilated.mk` 硬编码盖掉的 PYTHON3 / 空的 `CFG_CXXFLAGS_STD`
+  导致 GCC 16.2 默认 gnu++20 要 `basic_string` 的 C4 变体而这份 libstdc++ 只有 C1/C2 /
+  `VL_ATTR_WEAK` 不生效要自己写 `sc_time_stamp` / `verilator_coverage` 是个缺
+  `Pod::Usage` 的 Perl 脚本）。**配方已经手工走通过全链路了**（`cov.dat` 真出得来），
+  但**接入代码一行没有**。别因为"工具都装齐了"就把这一讲讲成能跑。
 - ~~**yosys 在 Windows 上按现在的装法起不来**（缺整套运行时 DLL）~~
   ★ **这条已经作废，别再说**。2026-09-29 起改走 OSS CAD Suite **整包**（572 MB），
   yosys 起得来、且 `tools/_yosys.py` 已经把它接进 `synth.py --engine yosys`。

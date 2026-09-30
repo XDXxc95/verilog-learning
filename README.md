@@ -328,6 +328,11 @@ python tools/setup_toolchain.py --selftest   # 装完编译+仿真跑一遍验�
   虚高到 11/19（真实是 6/19）。2026-09-29 更正。其余各项不是 `none` 就是 `software`。
   ★ **`sva.assert` 是后补的第 7 条，也是活生生的复现**：它那次没被找出来，因为当时
   `mingw` 还没装，读起来只是「要装 verilator + mingw」。**等 mingw 真装上的那一刻，
-  它立刻被判成可用，而实测 verilator 的 C++ 链路三关一关都没过**——所以现在 L3
-  可用数是 **7/19**（`toolchain.cc` 那条是真涨的：本仓库终于有个能用的现代 g++ 了）
+  它立刻被判成可用，而实测 verilator 的 C++ 链路五关一关都没过**——所以现在 L3
+  可用数是 **7/19**（`toolchain.cc` 那条是真涨的：本仓库终于有个能用的现代 g++ 了）。
+  ★ **2026-09-30 补记**：那五关现在**手工走通过全链路了**（`--cc --exe --coverage`
+  出得了可执行文件和 `cov.dat`），但**接入代码一行没写**，`gap` 不变。
+  另外原先记的病因「链接报 `WinMain` 未定义 / libstdc++ ABI 分裂」**是误读**，
+  真因是 `verilated.mk` 里 `CFG_CXXFLAGS_STD` 为空导致 GCC 16.2 用了 gnu++20——
+  详见 [`tools/README.md`](tools/README.md) 那一节。
 - ⬜ **开始学习** —— 等明确指令，届时**先新建学习分支**，再选级别

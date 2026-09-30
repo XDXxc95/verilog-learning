@@ -19,7 +19,7 @@
 | 内容 | 本仓库能做到 | 做不到 |
 |---|---|---|
 | RTL 功能设计 | ✅ 完整（iverilog 仿真 + 自动判定） | — |
-| 测试台与验证 | ✅ 完整（自检测试台、随机激励、覆盖率概念），功能覆盖率的**合并**能跑（`tools/cov.py`，零下载） | UVM 类库、商业仿真器特性；**代码覆盖率（行/翻转）跑不了**——verilator + mingw 都装了，但 verilator 的 C++ 链路本仓库还没接（缺 MAKE / PYTHON3 / 链接三关），所以 `cov.code` 仍是缺口 |
+| 测试台与验证 | ✅ 完整（自检测试台、随机激励、覆盖率概念），功能覆盖率的**合并**能跑（`tools/cov.py`，零下载） | UVM 类库、商业仿真器特性；**代码覆盖率（行/翻转）跑不了**——verilator + mingw 都装了、配方也手工验证过了（`cov.dat` 出得来），但 verilator 的 C++ 链路本仓库还没接（MAKE / PYTHON3 / `CFG_CXXFLAGS_STD` / `sc_time_stamp` / `verilator_coverage` **五关，代码一行没写**），所以 `cov.code` 仍是缺口 |
 | 逻辑综合 | ✅ **零下载**的 iverilog `-t blif`（门级网表）/ `-t sizer`（FF 与门数估算）**已接入**（`tools/synth.py`）；✅ **yosys 也已接入**（`--engine yosys`，2026-09-29）——真跑 `proc → opt → fsm → techmap → abc`，出**映射后**的门数，并支持 `--encoding-compare` 让综合器自己挑状态编码（⚠️ 只支持 one-hot / binary，没有 gray） | ❌ 跑不了 DC / Genus，**没有工艺库**，面积/时序不是真实数字（`abc` 用的是内置通用映射，只能横向比） |
 | 静态时序分析 | ⚠️ 只能讲原理 + 手算 slack + 读真实报告样例 | ❌ **Windows 原生无方案**（OpenSTA 需 WSL2）。没有真实 slack |
 | Lint / CDC 检查 | ⚠️ 自带 `_lint.py` 只覆盖锁存器；**verilator 已接入**（`tools/_vlint.py`）可补真 lint（位宽/组合环/多驱动）；⚠️ **verible 装是装在（0.0-4296），但还没有调用它的代码**，编码规范检查**目前跑不了** | ❌ CDC 没有成熟开源工具，只能人工审查 + 形式验证辅助 |
@@ -30,15 +30,17 @@
 
 **注意 `verilator` 分两条路，成本差很多**：`--lint-only` 装完即用；`--binary`（真正编译仿真模型，覆盖率、并发断言靠它）需要 C++ 编译器 + `make`。别把「装了 verilator」当成「断言能跑了」。
 
-⚠️ **这条链的瓶颈是编译器，不是 make** —— 这句**只对了一半**，2026-09-29 换完编译器之后更正的。先说前半：make 那步确实可以用 `mingw32-make` 顶替（verilator 认 `MAKE` 环境变量）。当时本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017 年），而 verilator 是按 **GCC 15.2.1** 配的，连撞四个坑：`-fcf-protection=none` 不认、`verilated.mk` 里 `python3` 找不到、`GetProcessMemoryInfo` 缺 `-lpsapi`、链接报 `WinMain` 未定义。于是装了现代 mingw-w64（`mingw` 条目）。
+⚠️ **这条链的瓶颈是编译器，不是 make** —— 这句**只对了一半**，2026-09-29 换完编译器之后更正的。先说前半：make 那步确实可以用 `mingw32-make` 顶替（verilator 认 `MAKE` 环境变量）。当时本机唯一的 g++ 是 Qt 自带的 mingw 7.3（2017 年），而 verilator 是按 **GCC 15.2.1** 配的，连撞四个坑：`-fcf-protection=none` 不认、`verilated.mk` 里 `python3` 找不到、`GetProcessMemoryInfo` 缺 `-lpsapi`、链接报未定义符号。于是装了现代 mingw-w64（`mingw` 条目）。
 
-**换完之后实测：仍然打不通。** 那个包装完 `found=True` 且 `usable=True`（自检真编过了），但 verilator `--binary` 走到底还是三关：
+**换完之后实测：仍然打不通。** 那个包装完 `found=True` 且 `usable=True`（自检真编过了），但 verilator `--binary` 走到底还得过五关：
 
-1. `make` 找不到 → 指 `MAKE` 到 `mingw32-make.exe`，**这关能过**；
+1. `make` 找不到 → 指 `MAKE` 到 `mingw32-make.exe`，**这关能过**（另外 makefile 必须在 `obj/` 目录里跑）；
 2. `verilated.mk` 里 `PYTHON3 = python3` 是**硬编码**、会盖掉环境变量，而 PATH 上那个 `python3` 是 Windows 商店的占位桩（退出码 49）——得用 make 命令行变量才顶得过去；
-3. 过了前两关，所有 `.cpp` 都编得出来，**最后卡在链接**：`undefined reference to WinMain` + 一串 `std::__cxx11::basic_string<...>::basic_string(...&&)`。
+3. 所有 `.cpp` 都编得出来，**卡在链接**。★ **2026-09-30 更正：原先这里写的是「`undefined reference to WinMain` + 一串 `std::__cxx11::basic_string<...>`，libstdc++ ABI 分裂」——那是误读。** 真因是 OSS 套件的 `verilated.mk` 里 **`CFG_CXXFLAGS_STD` 是空的**（它是按 Fedora / GCC 15.2.1 配的，那边默认就是 gnu++17），于是 GCC 16.2 用了**自己的默认 gnu++20**；C++20 下编译器生成的是 `basic_string` 的 **C4** 移动构造引用，而这份 libstdc++ 的 `.a`/`.dll.a` 都只提供 **C1/C2**。加 `CFG_CXXFLAGS_STD=-std=gnu++17` 即消失——**这一条才是关键**；
+4. 还得自己写 `double sc_time_stamp() { return 0.0; }`——verilator 把它声明成 `VL_ATTR_WEAK`，而这个属性在 mingw 上不生效；
+5. `verilator_coverage` 是个 **Perl** 脚本，本机 msys perl 缺 `Pod::Usage` 跑不起来。不过 `cov.dat` 是纯文本、格式极简，**用 Python 读完全可行**，不必依赖它。
 
-**这三关本仓库一行代码都没写**，所以 `cov.code`（覆盖率）和 `sva.assert`（并发断言）现在**装齐软件也不能动手**——这也是为什么这两条的 `gap` 是 `software+code` 而不是 `software`：标成 `software` 的话，软件一装它们就被判成「可用」，而实际跑不出来。**`mingw` 是清单里性价比最差的一项**：下 261 MB、占 940 MB 磁盘，换来的是「有一个现代 g++」（这一条是真拿到了），覆盖率/断言那两条一点没动。
+★ **2026-09-30 这五关手工全过了**：`--cc --exe --coverage` 全链路跑通，可执行文件出结果、`cov.dat` 1500 字节、toggle/line/branch/expr 四类记录齐全。**但「手工跑通」不等于「仓库接了」——本仓库一行接入代码都没写**，所以 `cov.code`（覆盖率）和 `sva.assert`（并发断言）现在**装齐软件也不能动手**——这也是为什么这两条的 `gap` 是 `software+code` 而不是 `software`：标成 `software` 的话，软件一装它们就被判成「可用」，而实际跑不出来。还有一条**没验证的前提**：本仓库的测试台（大量 `#延迟` + `$display` 标记）能不能过 verilator，还没试过。**`mingw` 是清单里性价比最差的一项**：下 261 MB、占 940 MB 磁盘，换来的是「有一个现代 g++」（这一条是真拿到了），覆盖率/断言那两条一点没动。
 
 ⚠️ **OSS CAD Suite 只装整包，不要装分组件**（2026-09-28 实测的分组件，2026-09-29 被整包推翻）。分组件 Windows 资产**不自包含**：`windows-x64-yosys.tgz` 装完，`yosys.exe` 启动即 `STATUS_DLL_NOT_FOUND`——它要 `libgcc_s_seh-1 / libwinpthread-1 / libstdc++-6 / libffi-8 / libreadline8 / tcl86 / zlib1` 一整组运行时 DLL，而组件里一个都不带。表现是**一个字节输出都没有、也没有报错信息**，只看「文件在不在」必然误判成装好了。
 
@@ -47,12 +49,16 @@
 整包（572 MB）**已实测全部能用**：`yosys 0.69+154`、`verilator_bin 5.053`、`z3 4.15.5`、`sby` / `eqy` / `slang 11.0.448` / `gtkwave 4.0.0` 逐一起得来，形式验证真跑通了一个 k-induction 作业。代价是 `.tools/oss` 占 **2.1 GB**。`check_tools.py` 的判据是 `found and usable`（真跑一次功能自检），所以「文件在」不会被当成「能用」。
 
 ⛔ **上面这些「实测可用」说的是软件起得来，不等于仓库跑得动。** 2026-09-29 更正：
-`yosys` / `sby` / `eqy` / `z3` 装好了，**但 `tools/` 里调用它们的代码一度一处都没有**——
-`sta.estimate`、`cdc.formal`、`formal.prop`、`formal.lec` 这四条能力因此标着
-`gap: "software+code"`（缺的是**接入代码**）。同理 `lint.style` 要的 verible 也装好了，
+`yosys` / `sby` / `eqy` / `z3` 装好了，**但 `tools/` 里调用它们的代码一度一处都没有**。
+
+★ **2026-09-30 进展：yosys 那半边已经接上了。** `tools/_yosys.py` + `synth.py --engine yosys`
+落地，「让综合器自己挑状态编码」和「过 `abc` 映射后的真实门数」现在**真能跑**——
+但注意 `fsm_recode` 只认 `one-hot` 和 `binary`，**灰度 / 约翰逊编码综合器替不了你挑**。
+**与此同时 `sta.estimate`、`cdc.formal`、`formal.prop`、`formal.lec` 四条一条没动**，
+仍标着 `gap: "software+code"`（缺的是**接入代码**：`abc -liberty` 的延时估算、
+`.sby` 作业、eqy 划分脚本，一样都没写）。同理 `lint.style` 要的 verible 也装好了，
 缺的同样是接入代码。**现在的 L3 可用数是 7/19，不是 11/19**——那几条虚高是
 「软件一装就报可用、而 integration 里自己写着仓库有活干」造成的。
-要真正拿它们上课，得先按 `integration` 字段写接入代码。
 （★ 数字变过两次：先 6/19，2026-09-29 装了 mingw 后一度报 8/19，其中 `toolchain.cc`
 是真涨的、`sva.assert` 是假的，把后者改回 `software+code` 之后落在 **7/19**。）
 

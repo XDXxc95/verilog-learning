@@ -91,8 +91,9 @@ verilator + mingw」。**等 mingw 真装上的那一刻，它立刻被判成「
 
 ★ **2026-09-29 mingw 装完，这个延迟发作的谎真的发作了一次**：`sva.assert` 当时标的是
 `software`（requires `verilator` + `mingw`），两个一装齐，`evaluate()` 立刻判它**可用**，
-而实测**根本跑不通**——verilator 的 C++ 链路还有 MAKE / 硬编码的 `PYTHON3` / 链接期
-`WinMain` 三关没接，本仓库一行代码都没写。`mingw.caveat` 里明明写着「这一步尚未实现」，
+而实测**根本跑不通**——verilator 的 C++ 链路还有 MAKE / 硬编码的 `PYTHON3` /
+`CFG_CXXFLAGS_STD` / `sc_time_stamp` / `verilator_coverage` 五关没接（见下节），
+本仓库一行代码都没写。`mingw.caveat` 里明明写着「这一步尚未实现」，
 `gap` 却让它判成了可用。**已改成 `software+code`**，L3 可用数从虚高的 8/19 回落到 7/19
 （剩下那条 `toolchain.cc` 是真涨的：本仓库现在真有一个能用的现代 g++ 了）。
 
@@ -159,7 +160,7 @@ yosys-slang-plugin，没有独立的 slang.exe」，实测 `.tools/oss/bin/slang
 
 ★ **`mingw` 是清单里性价比最差的一项，装之前想清楚**：下 261 MB、占 940 MB 磁盘，
 换来的是「有一个现代 g++」，而 `cov.code` / `sva.assert` **装完仍然不能动手**
-（还有三关没接，见下节）。`toolchain.cc` 那一条是真拿到了。
+（还有五关没接，见下节）。`toolchain.cc` 那一条是真拿到了。
 
 **只有缓存可删，而缓存恰恰不该删**：`--verify-lock` 是拿缓存里的文件算 sha256
 去对锁记录的。缓存不在，它只能报「无法校验 6」——**全绿变成全没查**，
@@ -208,22 +209,35 @@ found  = True
 usable = True      ← functional 那条 g++ 自检真的编过了，不是假的
 ```
 
-**但它换来的能力仍然不能动手。** 2026-09-29 拿一份最小的 SVA 文件实测 verilator
-`--binary` 全链路，卡点依次是三关：
+**但它换来的能力仍然不能动手。** 2026-09-29 拿一份最小的 SVA 文件实测，
+2026-09-30 又把 `--cc --exe --coverage` 全链路完整重跑了一遍，卡点依次是这五关：
 
 | # | 卡在哪 | 为什么 | 本仓库做了吗 |
 |---|---|---|---|
-| 1 | `make` 找不到 | verilator 认 `MAKE` 环境变量，指到 `.tools/mingw/bin/mingw32-make.exe` 即可 | ❌ 没接 |
+| 1 | `make` 找不到 | verilator 认 `MAKE` 环境变量，指到 `.tools/mingw/bin/mingw32-make.exe` 即可。★ 另外 **makefile 必须在 `obj/` 目录里跑**（`make -f obj/V<top>.mk` 会找不到 `V<top>_classes.mk`） | ❌ 没接 |
 | 2 | `python3` 是商店占位桩 | `verilated.mk` 里 `PYTHON3 = python3` 是**硬编码**、会盖掉环境变量；PATH 上那个 `python3` 是 `WindowsApps\python3`（退出码 49）。得用 **make 命令行变量**才顶得过去 | ❌ 没接 |
-| 3 | **链接失败** | 过了前两关所有 `.cpp` 都编得出来，最后 `undefined reference to WinMain` + 一串 `std::__cxx11::basic_string<...>::basic_string(...&&)` | ❌ 没接 |
+| 3 | **链接失败** | 症状里那句 `undefined reference to WinMain` 是个**误读**，真因跟 WinMain、跟 libstdc++ ABI 分裂都无关。真因是 `verilated.mk` 里 `CFG_CXXFLAGS_STD` **是空的**（套件在 Fedora / GCC 15.2.1 上配的，那边默认就是 gnu++17），GCC 16.2 于是用了**自己的默认 gnu++20**；C++20 下编译器生成的是 `basic_string` 的 **C4** 移动构造引用，而这份 libstdc++ 的 `.a` / `.dll.a` 都只提供 **C1 / C2**。加 `CFG_CXXFLAGS_STD=-std=gnu++17` 即消失 | ❌ 没接 |
+| 4 | `sc_time_stamp` 未定义 | verilator 把它声明成 `VL_ATTR_WEAK`，而这个属性在 mingw 上不生效，得自己写一个 `double sc_time_stamp() { return 0.0; }` | ❌ 没接 |
+| 5 | `verilator_coverage` 跑不起来 | 它是个 **Perl** 脚本，本机 msys perl 缺 `Pod::Usage`。但 `cov.dat` 是纯文本（`C '<两字母字段前缀拼成的键>' <计数>`），**用 Python 读完全可行**，不必依赖 perl | ❌ 没接 |
+
+★ **配方是齐的、能跑通的**：2026-09-30 按上面五条手工走通了 `--cc --exe --coverage`
+全链路，可执行文件跑出结果、`cov.dat` 1500 字节、toggle / line / branch / expr
+四类记录齐全。**但「能手工跑通」不等于「仓库接了」**——listing 上那几条要一条条手敲，
+`tools/` 里没有任何一处做过。所以这两条能力**仍然不能动手**，`gap` 保持 `software+code`。
+还有一条**没验证的前提**：本仓库的测试台（大量 `#延迟` + `$display` 标记）能否过
+verilator 还没试过。
 
 **这张表的用法**：`usable=True` 只证明「g++ 能编 verilator 风格的代码」，
 **不证明「verilator 能借它造出模型」**。后者才是 `cov.code` / `sva.assert` 要的。
 所以那两条的 `gap` 是 `software+code` 而不是 `software`——
 **装完软件那一刻它们会被 `evaluate()` 判成可用，而实际跑不出来**，正是最该防的那类谎。
 
-顺带纠正一条旧结论：以前写的是「瓶颈是编译器不是 make，换现代 mingw 就好」。
-换完之后发现**只对了一半**——编译器那一层解决了，上面这三关一层都没少。
+顺带纠正两条旧结论：(1)「瓶颈是编译器不是 make，换现代 mingw 就好」——换完才发现
+**只对了一半**，编译器那一层解决了，上面这五关一层都没少；(2)「最后卡在链接，
+报 `undefined reference to WinMain` + 一串 `std::__cxx11::basic_string`，是 libstdc++
+ABI 分裂」——**这个诊断是错的**，`WinMain` 只是链接失败症状里的噪声，真因是 `-std`
+版本不对导致要的符号变体不存在。**错的诊断比没有诊断更坏**：照着它去「补 DLL」
+会一路走到 `STATUS_ENTRYPOINT_NOT_FOUND`，全是白工。
 
 ⚠️ **可复现性**：OSS CAD Suite 的 `bucket-*` 是**滚动 tag**，同名资产每天被覆盖。
 要固定版本必须 `--lock` 记 sha256——不带 `--lock` 的安装等于「装到哪个算哪个」。

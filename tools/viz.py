@@ -217,36 +217,43 @@ def main(argv: list[str] | None = None) -> int:
 def _run_one(args, designs: list[Path], want_wave: bool, want_schem: bool,
              opened: list[Path], failed: list[str]) -> int:
     inputs = list(designs) + ([args.tb] if args.tb else [])
-    top = args.top or _guess_top(inputs)
-    out_dir = (args.out / _safe_name(top or "design"))
+    # ★ 结构图的顶层和仿真的顶层不是一回事，别用同一个变量（见 _guess_sim_top）。
+    #   `--top` 用户显式给的时候照旧覆盖两者 —— README / AGENT.md 里举的就是
+    #   `--top tb_xxx`，那本来就是仿真顶层。
+    sch_top = args.top or _guess_top(inputs)
+    sim_top = args.top or _guess_sim_top(designs, args.tb)
+    out_dir = (args.out / _safe_name(sch_top or "design"))
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if want_wave:
         _head("编译 + 仿真")
-        result = run_sim(designs, args.tb, top, Path("build"), args.timeout)
+        result = run_sim(designs, args.tb, sim_top, Path("build"), args.timeout)
         print(f"  {_status_line(result)}")
         for d in (result.get("compile") or {}).get("diagnostics") or []:
             sev = d.get("severity")
             mark = "✗" if sev == "error" else "!"
             print(f"  {mark} {d.get('file')}:{d.get('line')} {d.get('message_zh')}")
         if result.get("status") in ("compile_error", "env_error"):
-            failed.append(f"{top} 编译未通过，没有波形可以看")
+            failed.append(f"{sim_top} 编译未通过，没有波形可以看")
             want_wave = False
         else:
             for a in result.get("next_actions_zh") or []:
                 print(f"  → {a}")
             vcd_rel = (result.get("artifacts") or {}).get("vcd")
             if not vcd_rel:
-                print("  ! 仿真没有产生 VCD（测试台里有 $dumpfile/$dumpvars 吗？）")
+                # 把 sim.py 那句「找了哪里」原样带出来 —— 不许替它断言
+                # 学习者没写 $dumpfile（文件可能只是落在了别的地方）。
+                why = (result.get("observe") or {}).get("reason")
+                print(f"  ! 没有波形可以画。{why or ''}")
             else:
-                opened += do_wave(Path(vcd_rel), out_dir, top or "波形",
+                opened += do_wave(Path(vcd_rel), out_dir, sim_top or "波形",
                                   args.ascii, True, args.columns)
             if result.get("status") in ("fail", "timeout"):
-                failed.append(f"{top} 判定为{_status_line(result)}")
+                failed.append(f"{sim_top} 判定为{_status_line(result)}")
 
     if want_schem:
         _head("结构图")
-        made = do_schematic(inputs, out_dir, top)
+        made = do_schematic(inputs, out_dir, sch_top)
         for p in made:
             print(f"  {p}")
         opened += made
@@ -260,13 +267,20 @@ def _run_one(args, designs: list[Path], want_wave: bool, want_schem: bool,
 
 def _run_compare(args, want_wave: bool, want_schem: bool,
                  opened: list[Path], failed: list[str]) -> int:
-    """把多个版本各自跑一遍，产出的文件并用版本名区分。"""
+    """把多个版本各自跑一遍，产出的文件并用版本名区分。
+
+    ★ 这里的 `--top` 是**被对比的那个模块名**（几个版本都得叫这个名），
+      用它来分目录 —— 它**不是**仿真顶层。仿真顶层是测试台，
+      由 `_guess_sim_top()` 从 `--tb` 里认（`--compare` 的文档示例给的是
+      `--top decoder3_8`，拿它当仿真顶层的话测试台根本不会被实例化，
+      整组对比一个波形都出不来）。
+    """
     top = args.top
     if not top:
         print("--compare 必须显式给 --top（几个版本的顶层模块名必须一致）")
         return EXIT_USAGE
 
-    print(f"对比 {len(args.design)} 个版本，顶层模块 {top}")
+    print(f"对比 {len(args.design)} 个版本，模块 {top}")
     for design in args.design:
         label = design.stem
         _head(f"{label}（{design}）")
@@ -274,7 +288,9 @@ def _run_compare(args, want_wave: bool, want_schem: bool,
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if want_wave:
-            result = run_sim([design], args.tb, top, Path("build"), args.timeout)
+            result = run_sim([design], args.tb,
+                             _guess_sim_top([design], args.tb),
+                             Path("build"), args.timeout)
             print(f"  判定：{_status_line(result)}")
             for t in result.get("tests") or []:
                 if t.get("status") == "fail":
@@ -285,7 +301,8 @@ def _run_compare(args, want_wave: bool, want_schem: bool,
                 opened += do_wave(Path(vcd_rel), out_dir, f"{top} · {label}",
                                   args.ascii, True, args.columns)
             else:
-                print("  ! 没有产生 VCD")
+                why = (result.get("observe") or {}).get("reason")
+                print(f"  ! 没有波形可以画。{why or ''}")
                 failed.append(f"{label} 没有波形")
 
         if want_schem:
@@ -295,7 +312,35 @@ def _run_compare(args, want_wave: bool, want_schem: bool,
 
 
 def _guess_top(inputs: list[Path]) -> str | None:
+    """猜**结构图**的顶层：优先非 `tb*` 的模块（被画的应该是设计本身）。"""
     mods = simmod.scan_modules(inputs)
+    if not mods:
+        return None
+    cands = [m for m in mods if not m.lower().startswith("tb")]
+    return cands[0] if cands else mods[0]
+
+
+def _guess_sim_top(designs: list[Path], tb: Path | None) -> str | None:
+    """猜**仿真**的顶层 —— 有测试台就**必须**是测试台。
+
+    ★ 这两个顶层不是一回事，混用会静默出错：
+      iverilog 收到 `-s <顶层>` 后只展开那一棵子树。拿设计模块当仿真顶层，
+      测试台根本不会被实例化 —— 不打印任何标记、不执行 `$dumpfile`。
+      症状是「无法判定 / 测试台缺少判定标记 / 没有产生 VCD」，
+      **把工具的错说成学习者测试台的错**，而且它明明写对了。
+
+    实测（2026-09-30，`dut_counter4.v` + `tb_counter4.v`，唯一的差别就是顶层名）:
+
+        -s counter4      status=inconclusive   markers= 0
+        -s tb_counter4   status=pass           markers=12
+
+    所以：给了 `--tb` 就从**测试台文件**里挑模块；没给才退回设计模块。
+    """
+    if tb is not None:
+        mods = simmod.scan_modules([tb])
+        if mods:
+            return mods[0]
+    mods = simmod.scan_modules(designs)
     if not mods:
         return None
     cands = [m for m in mods if not m.lower().startswith("tb")]

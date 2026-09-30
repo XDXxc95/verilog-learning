@@ -343,8 +343,11 @@ def main() -> int:
 
     # ============ 10. 从 sim.py 的结果 JSON 取波形 ============
     # 这里用**手写的** JSON 指向刚跑出来的真波形：仿真自己的 JSON 记的
-    # artifacts.vcd 是 null（测试台把 $dumpfile 写到了 workdir 之外，
-    # 见 sim.py 里 _snapshot_vcd 的说明）—— 那条路单独用第 9 节验。
+    # artifacts.vcd 是 null —— 这一节的 sim 把 workdir 指到了 build/_smoke_toggle/<tag>，
+    # 而测试台里的 $dumpfile 写死在 build/_smoke_cnt_enc.vcd，**两个位置都不是**
+    # （_snapshot_vcd 只看 workdir 递归 + cwd 一层），所以确实找不到。
+    # 「找不到时该怎么说话」由 check_viz.py 第 3 节钉住 —— 那是**措辞**问题，
+    # 这里这一节要验的是另一件事：JSON 里的路径按仓库根解析。
     # 这一段要验的是**路径解析**：JSON 里的路径是相对仓库根记的，
     # 换个 cwd 就跑不通，所以必须按 root 解析。
     print("\n--- 从 sim.py 结果 JSON 取波形（路径按仓库根解析）---")

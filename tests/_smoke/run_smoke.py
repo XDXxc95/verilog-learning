@@ -511,10 +511,10 @@ def main() -> int:
 # 判定链路之外的工具检查。分成几个脚本是因为它们依赖的东西不同
 # （波形解析要 VCD，绘制检查要 node），任何一个缺失都不该拖垮其余部分。
 TOOL_CHECKS = ["check_wave.py", "check_wave_js.py", "check_wave_draw.py",
-               "check_observe.py", "check_schematic.py", "check_lesson.py",
-               "check_regress.py", "check_synth.py", "check_cov.py",
-               "check_toggle.py", "check_manifest.py", "check_vlint.py",
-               "check_toolchain.py"]
+               "check_observe.py", "check_schematic.py", "check_viz.py",
+               "check_lesson.py", "check_regress.py", "check_synth.py",
+               "check_cov.py", "check_toggle.py", "check_manifest.py",
+               "check_vlint.py", "check_toolchain.py"]
 
 
 def _run_tool_checks() -> int:

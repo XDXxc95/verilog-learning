@@ -765,7 +765,7 @@ def _cover_block(markers: Markers | None = None, reason: str | None = None) -> d
 
 
 def _observe_block(
-    cfg: SimConfig, root: Path, vcd_new: list[str], tests: list[dict]
+    cfg: SimConfig, vcd_new: list[str], tests: list[dict]
 ) -> dict:
     """从波形里量出事实，供上层讲解。
 
@@ -776,12 +776,20 @@ def _observe_block(
     if cfg.no_observe:
         return {"ok": False, "reason": "本次以 --no-observe 运行，未做波形观察"}
     if not vcd_new:
+        # ★ 不许写「测试台里需要 $dumpfile + $dumpvars」这种断言 —— 我们
+        # **找不到**波形不等于**他没写**（见 _snapshot_vcd 的坑 3）。
+        # 说清找了哪儿，让使用者自己判断是没写、还是写到了没扫的地方。
         return {
             "ok": False,
-            "reason": "本次仿真没有产生 VCD 波形。测试台里需要 $dumpfile + $dumpvars",
+            "reason": (
+                "本次仿真没有找到 VCD 波形。已找过："
+                f"{cfg.workdir}（递归）和 {Path.cwd()}（只一层）。"
+                "要么测试台没写 $dumpfile + $dumpvars，"
+                "要么写到了这两个位置之外的别处（$dumpfile 的路径是相对进程 cwd 解析的）"
+            ),
         }
-    # workdir 可能已经是绝对路径，这时 root / workdir 会取 workdir 那一边
-    path = root / cfg.workdir / vcd_new[0]
+    # vcd_new 里存的是绝对路径（见 _snapshot_vcd）
+    path = Path(vcd_new[0])
     try:
         return observe(path, tests)
     except Exception as e:  # noqa: BLE001 —— 见上面的说明，观察层不许带崩判定
@@ -1022,10 +1030,10 @@ def _run_sim(cfg: SimConfig) -> tuple[dict, int]:
         lint=lint_block,
         artifacts={
             "vvp": str(vvp_path),
-            "vcd": (str(cfg.workdir / vcd_new[0]) if vcd_new else None),
-            "vcd_all": [str(cfg.workdir / v) for v in vcd_new],
+            "vcd": (_vcd_display(vcd_new[0], root, cfg.workdir) if vcd_new else None),
+            "vcd_all": [_vcd_display(v, root, cfg.workdir) for v in vcd_new],
         },
-        observe=_observe_block(cfg, root, vcd_new, tests),
+        observe=_observe_block(cfg, vcd_new, tests),
         cover=_cover_block(markers),
         error_tags=_error_tags(diags, markers, rres),
         next_actions_zh=_run_next_actions(status, markers, rres, tests, diags),
@@ -1239,10 +1247,31 @@ def _input_dirs(inputs: list[Path]) -> list[str]:
     return dirs
 
 
-def _snapshot_vcd(workdir: Path) -> dict[str, tuple[int, int]]:
-    """记录 workdir 下所有 *.vcd 的 (mtime, size)，键是相对 workdir 的路径。
+def _vcd_display(p: str, root: Path, workdir: Path) -> str:
+    """内部用的绝对路径 → 对外的展示路径。
 
-    两个坑：
+    在 workdir 里的保持原样（workdir 相对，和以前一致）；
+    落在别处的按**仓库根相对**记（posix 风格），这和 `toggle.py` 从
+    JSON 里取路径时的约定是同一条 —— 相对路径换个 cwd 就跑不通。
+    """
+    path = Path(p)
+    try:
+        return str(workdir / path.relative_to(workdir.resolve()))
+    except ValueError:
+        pass
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _snapshot_vcd(workdir: Path) -> dict[str, tuple[int, int]]:
+    """记录「本次可能写出波形的目录」里所有 *.vcd 的 (mtime, size)。
+
+    键是**解析后的绝对路径** —— 因为要扫的不止一个根目录，用相对路径做键会撞。
+    对外展示的路径由 `_vcd_display()` 负责转换。
+
+    三个坑：
 
     1. 只比较**文件名**不够。学习者反复跑同一个测试台时，
        `$dumpfile("build/x.vcd")` 每次覆盖同一个名字，第二次起的差值就是空集，
@@ -1253,17 +1282,36 @@ def _snapshot_vcd(workdir: Path) -> dict[str, tuple[int, int]]:
        写到 `build/sub/x.vcd` 就找不到了，"明明产生了波形却报告没有"。
        改用 rglob，并且靠上面的 mtime 比对把无关的旧文件排除掉，
        递归不会带来误报。
+
+    3. ★ workdir 只是「我们建议你往这儿写」，而 `$dumpfile("dump.vcd")`
+       的路径是**相对进程 cwd** 解析的。学习者写一个光秃秃的相对路径
+       非常自然，文件会落在仓库根，而只看 workdir 就会报出
+       「测试台里需要 $dumpfile + $dumpvars」——**文件就躺在旁边，
+       工具却把他的测试台说成没写**。这正是本仓库最防的那类谎：
+       把工具的眼界说成使用者的错。
+       所以 cwd 也要扫，但**只扫一层**：递归扫仓库根会一路走进
+       `.tools/`（4 GB），代价和收益不成比例。
+       ⚠️ 代价要认：`$dumpfile("sub/x.vcd")` 写到别的目录深处仍然找不到。
+       这时报的话必须改为「**我找了哪里**」，不能再断言他没写 $dumpfile。
     """
+    roots: list[tuple[Path, bool]] = [(workdir, True)]   # (根, 是否递归)
+    cwd = Path.cwd()
+    if cwd != workdir.resolve():
+        roots.append((cwd, False))
+
     out: dict[str, tuple[int, int]] = {}
-    try:
-        for p in workdir.rglob("*.vcd"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            out[p.relative_to(workdir).as_posix()] = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        pass
+    for base, deep in roots:
+        try:
+            for p in (base.rglob("*.vcd") if deep else base.glob("*.vcd")):
+                try:
+                    if not p.is_file():
+                        continue
+                    st = p.stat()
+                except OSError:
+                    continue
+                out[str(p.resolve())] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            continue
     return out
 
 
